@@ -978,6 +978,7 @@ struct vk_submission {
     vk_command_buffer* buffer = nullptr;
     std::vector<vk_semaphore> wait_semaphores;
     std::vector<vk_semaphore> signal_semaphores;
+    vk::Pipeline last_pipeline;
 };
 
 typedef std::vector<vk_submission> vk_sequence;
@@ -6684,7 +6685,10 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
 
     subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
-    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    if (pipeline->pipeline != subctx->s->last_pipeline) {
+        subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+        subctx->s->last_pipeline = pipeline->pipeline;
+    }
     subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
                                 pipeline->layout,
                                 0,
@@ -8916,6 +8920,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     // Loop over the batch dimension, flushing every EXPERTS_PER_SUBMIT dispatches
     // to overlap CPU command buffer preparation with GPU execution.
+    // When nei1 > 1, keep the pipeline bound across iterations to reduce
+    // Vulkan driver overhead from redundant bindPipeline calls.
     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
