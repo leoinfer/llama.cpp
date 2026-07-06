@@ -8688,6 +8688,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ctx->prealloc_split_k_need_sync = true;
 }
 
+// Flush the compute context: end the current command buffer, submit it
+// asynchronously (no fence), and start a new one for the next batch.
+// This overlaps CPU command buffer preparation with GPU execution.
+static void ggml_vk_flush_compute_ctx(ggml_backend_vk_context * ctx, vk_context& subctx) {
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, {});
+    ctx->submit_pending = true;
+    ggml_vk_ctx_begin(ctx->device, subctx);
+}
+
+// Number of expert dispatches to submit together before flushing.
+// Splitting the expert loop into smaller submissions lets the GPU
+// start processing the first experts while the CPU prepares the next batch.
+#define GGML_VK_EXPERTS_PER_SUBMIT 1
+
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -8892,7 +8907,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
-    // Loop over the batch dimension
+    // Loop over the batch dimension, flushing every EXPERTS_PER_SUBMIT dispatches
+    // to overlap CPU command buffer preparation with GPU execution.
     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
@@ -8910,6 +8926,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
                 d_ids,
             },
             pc, { groups_x, (uint32_t)nei0, groups_z });
+
+        if ((expert_i1 + 1) % GGML_VK_EXPERTS_PER_SUBMIT == 0 && expert_i1 + 1 < nei1) {
+            ggml_vk_flush_compute_ctx(ctx, subctx);
+        }
     }
 
     if (x_non_contig) {
@@ -8920,6 +8940,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// Flush the compute context: end the current command buffer, submit it
+// asynchronously (no fence), and start a new one for the next batch.
+// This overlaps CPU command buffer preparation with GPU execution.
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -15472,7 +15495,7 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ false,
+        /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ true,
     };
 }
