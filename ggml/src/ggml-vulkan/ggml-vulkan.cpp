@@ -5486,9 +5486,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
             for (auto& prop : cm_props) {
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
 
+                // RADV (AMD Mesa) reports queue-family scope on RDNA 4,
+                // while NVIDIA/MoltenVK use subgroup scope. Accept both.
                 if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat16 &&
                     (vk::ComponentTypeKHR)prop.BType == vk::ComponentTypeKHR::eFloat16 &&
-                    (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup
+                    ((vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup ||
+                     (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eQueueFamily)
                 ) {
                     if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat32 &&
                         (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat32) {
@@ -5525,7 +5528,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                            (vk::ComponentTypeKHR)prop.BType      == vk::ComponentTypeKHR::eSint8 &&
                            (vk::ComponentTypeKHR)prop.CType      == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eSint32 &&
-                           (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup &&
+                           ((vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup ||
+                            (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eQueueFamily) &&
                            device->coopmat_int_m == 0
                 ) {
                     device->coopmat_int_support = true;
@@ -5538,7 +5542,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                     prop.BType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
                     prop.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
                     prop.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
-                    (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup
+                    ((vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup ||
+                     (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eQueueFamily)
                 ) {
                     // coopmat sizes not set yet
                     if (device->coopmat_m == 0) {
@@ -8701,7 +8706,9 @@ static void ggml_vk_flush_compute_ctx(ggml_backend_vk_context * ctx, vk_context&
 // Number of expert dispatches to submit together before flushing.
 // Splitting the expert loop into smaller submissions lets the GPU
 // start processing the first experts while the CPU prepares the next batch.
-#define GGML_VK_EXPERTS_PER_SUBMIT 1
+// Set to 0 to disable. For Gemma 4 (8 experts, ~40 layers, tg ~96 t/s),
+// values > 4 avoid excessive driver submission overhead.
+#define GGML_VK_EXPERTS_PER_SUBMIT 0
 
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
@@ -8927,7 +8934,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             },
             pc, { groups_x, (uint32_t)nei0, groups_z });
 
-        if ((expert_i1 + 1) % GGML_VK_EXPERTS_PER_SUBMIT == 0 && expert_i1 + 1 < nei1) {
+        if (GGML_VK_EXPERTS_PER_SUBMIT > 0 && (expert_i1 + 1) % GGML_VK_EXPERTS_PER_SUBMIT == 0 && expert_i1 + 1 < nei1) {
             ggml_vk_flush_compute_ctx(ctx, subctx);
         }
     }
@@ -15495,9 +15502,13 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ true,
+        /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ true,
     };
+    // NOTE: buffer_from_host_ptr is disabled because RADV requires mmap'd
+    // tensor pointers to be aligned to minImportedHostPointerAlignment (4096),
+    // which GGUF files typically don't satisfy. Re-enable with alignment fix.
+    // The host_buffer flag provides adequate performance for standard allocation.
 }
 
 static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
