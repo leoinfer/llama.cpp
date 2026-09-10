@@ -939,6 +939,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         if (buft) {
                             buft_list[ggml_backend_buft_name(buft)] = buft;
                         }
+                        // the device's pinned host buffer type is a valid placement target as well
+                        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+                        if (host_buft != nullptr && host_buft != ggml_backend_cpu_buffer_type()) {
+                            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+                        }
                     }
                 }
                 auto override_group_span_len = std::strcspn(value, ",");

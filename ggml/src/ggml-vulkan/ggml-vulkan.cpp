@@ -383,6 +383,7 @@ struct vk_queue {
 };
 
 static const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft);
+ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
 static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
 static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft);
 static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft);
@@ -2571,12 +2572,29 @@ static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
 
 static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf, size_t& buf_offset);
 
+// A weight tensor can live in the backend's pinned host buffer (a deliberate tier for models larger
+// than VRAM). Such tensors are still computed on the device, so they resolve to their host vk_buffer
+// exactly like mapped UMA tensors do.
+static bool ggml_vk_tensor_is_host_buffer(const ggml_tensor * t) {
+    return t != nullptr && t->buffer != nullptr && t->buffer->buft == ggml_backend_vk_host_buffer_type();
+}
+
+static bool ggml_vk_tensor_host_buffer(const ggml_backend_vk_context * ctx, const ggml_tensor * t, vk_buffer & buf, size_t & off) {
+    buf = nullptr;
+    off = 0;
+    if (!ctx->device->uma && !ggml_vk_tensor_is_host_buffer(t)) {
+        return false;
+    }
+    ggml_vk_host_get(ctx->device, t->data, buf, off);
+    return buf != nullptr;
+}
+
 static size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
-    if (ctx->device->uma) {
+    {
         vk_buffer buf = nullptr;
         size_t off = 0;
-        ggml_vk_host_get(ctx->device, t->data, buf, off);
+        ggml_vk_tensor_host_buffer(ctx, t, buf, off);
         if (buf) {
             return off;
         }
@@ -9343,11 +9361,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool src0_uma = false;
     bool src1_uma = false;
 
-    if (ctx->device->uma) {
-        ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
-        src0_uma = d_Qx != nullptr;
-        src1_uma = d_Qy != nullptr;
+    {
+        src0_uma = ggml_vk_tensor_host_buffer(ctx, src0, d_Qx, qx_buf_offset);
+        src1_uma = ggml_vk_tensor_host_buffer(ctx, src1, d_Qy, qy_buf_offset);
     }
 
     // TODO: Clean up this logic to pick src1 type by capability
@@ -10361,13 +10377,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     bool src1_uma = false;
     bool ids_uma = false;
 
-    if (ctx->device->uma) {
-        ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
-        ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
-        src0_uma = d_Qx != nullptr;
-        src1_uma = d_Qy != nullptr;
-        ids_uma = d_ids != nullptr;
+    {
+        src0_uma  = ggml_vk_tensor_host_buffer(ctx, src0, d_Qx, qx_buf_offset);
+        src1_uma  = ggml_vk_tensor_host_buffer(ctx, src1, d_Qy, qy_buf_offset);
+        ids_uma   = ggml_vk_tensor_host_buffer(ctx, ids,  d_ids, ids_buf_offset);
     }
 
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
@@ -12782,10 +12795,7 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
         offset[i] = 0;
         uma[i] = false;
 
-        if (ctx->device->uma) {
-            ggml_vk_host_get(ctx->device, tensors[i]->data, buf[i], offset[i]);
-            uma[i] = buf[i] != nullptr;
-        }
+        uma[i] = ggml_vk_tensor_host_buffer(ctx, tensors[i], buf[i], offset[i]);
         if (!uma[i]) {
             buf[i] = buf_ctx[i]->dev_buffer;
             offset[i] = vk_tensor_offset(tensors[i]) + tensors[i]->view_offs;
@@ -13827,10 +13837,7 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
             offset[i] = 0;
             uma[i] = false;
 
-            if (ctx->device->uma) {
-                ggml_vk_host_get(ctx->device, tensors[i]->data, buf[i], offset[i]);
-                uma[i] = buf[i] != nullptr;
-            }
+            uma[i] = ggml_vk_tensor_host_buffer(ctx, tensors[i], buf[i], offset[i]);
             if (!uma[i]) {
                 buf[i] = buf_ctx[i]->dev_buffer;
                 offset[i] = vk_tensor_offset(tensors[i]) + tensors[i]->view_offs;
