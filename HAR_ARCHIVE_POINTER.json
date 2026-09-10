@@ -1,0 +1,17 @@
+{
+  "schema": "leo-har-archive-pointer.v1",
+  "status": "RESEARCH_ARCHIVE_NOT_PRODUCTION_RUNTIME",
+  "archive_path": "/home/leo/research/overnight-flash-next-campaign",
+  "inventory": "/home/leo/research/overnight-flash-next-campaign/09_REPORT/HAR_LLAMA_PORTING_INVENTORY.json",
+  "historical_control": "approximately 3.7 decode tokens/s on RX 9060 XT; see campaign receipts",
+  "decision": "Use llama.cpp as production authority; mine HAR for measured ideas and correctness evidence only.",
+  "preserve": [
+    "HAR source",
+    "kernel and telemetry receipts",
+    "state/cache experiments",
+    "MTP research",
+    "R4X research",
+    "correctness findings",
+    "rejected experiments"
+  ]
+}
