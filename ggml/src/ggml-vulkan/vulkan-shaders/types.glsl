@@ -1800,6 +1800,14 @@ struct block_iq4_xs_packed32
 #define A_TYPE_PACKED32 block_iq4_xs_packed32
 #endif
 
+#define QUANT_K_D32A3 32
+#define QUANT_R_D32A3 2
+struct block_d32a3
+{
+    float16_t d;
+    uint8_t qs[12];
+};
+
 #define QUANT_K_IQ4_NL 32
 #define QUANT_R_IQ4_NL 2
 
@@ -1814,6 +1822,13 @@ struct block_iq4_nl_packed16
     float16_t d;
     uint16_t qs[QUANT_K_IQ4_NL/2/2];
 };
+
+#if defined(DATA_A_D32A3)
+#define QUANT_K QUANT_K_D32A3
+#define QUANT_R QUANT_R_D32A3
+#define QUANT_AUXF 1
+#define A_TYPE block_d32a3
+#endif
 
 #if defined(DATA_A_IQ4_NL)
 #define QUANT_K QUANT_K_IQ4_NL

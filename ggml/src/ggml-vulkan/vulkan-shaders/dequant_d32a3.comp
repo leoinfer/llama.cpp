@@ -1,0 +1,28 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_d32a3 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+const float kd32a3_levels[8] = float[8](-2.151945, -1.343910, -0.756005, -0.245094, 0.245094, 0.756005, 1.343910, 2.151945);
+
+// one invocation per 4 values of the block payload (256 threads resolve 1024 values = 32 blocks)
+void main() {
+    const uint v = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    if (v >= p.nel) {
+        return;
+    }
+    const uint ib   = v / 32;
+    const uint iv   = v % 32;
+    const uint bit  = 3u * iv;
+    const uint byte0 = bit >> 3;
+    const uint shift = bit & 7;
+    uint w = uint(data_a[ib].qs[byte0]);
+    if (byte0 + 1 < 12) { w |= uint(data_a[ib].qs[byte0 + 1]) << 8; }
+    if (byte0 + 2 < 12) { w |= uint(data_a[ib].qs[byte0 + 2]) << 16; }
+    const float d = float(data_a[ib].d);
+    data_b[v] = D_TYPE(d * kd32a3_levels[(w >> shift) & 7]);
+}
