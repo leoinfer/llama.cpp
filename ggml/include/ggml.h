@@ -422,6 +422,7 @@ extern "C" {
         // GGML_TYPE_Q4_0_4_8 = 32,
         // GGML_TYPE_Q4_0_8_8 = 33,
         GGML_TYPE_TQ1_0   = 34,
+        GGML_TYPE_D32A3   = 43, // 32-value block, fp16 scale + 32x 3-bit Lloyd codes (R4X-V2, 3.5 bpw)
         GGML_TYPE_TQ2_0   = 35,
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
@@ -430,7 +431,7 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_COUNT   = 44,
     };
 
     // [TAG_GGML_PREC]

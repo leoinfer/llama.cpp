@@ -6,6 +6,7 @@
 #include "traits.h"
 #include "iqp.h"
 #include "ggml-cpu-impl.h"
+#include "ggml-quants.h"
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -212,6 +213,25 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+
+// R4X-V2 D32A3: generic CPU dot (dequantise the block into a small buffer, then f32 dot product).
+static void ggml_vec_dot_d32a3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    const block_d32a3 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    const int nb = n / QK_D32A3;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float buf[QK_D32A3];
+        dequantize_row_d32a3(x + i, buf, QK_D32A3);
+        for (int j = 0; j < QK_D32A3; j++) {
+            sumf += buf[j]*y[i*QK_D32A3 + j];
+        }
+    }
+    *s = sumf;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -375,6 +395,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = NULL,
         .vec_dot                  = ggml_vec_dot_iq1_m_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_D32A3] = {
+        .from_float               = (ggml_from_float_t) quantize_row_d32a3_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_d32a3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_IQ4_NL] = {

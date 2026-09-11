@@ -457,6 +457,14 @@ typedef struct {
     uint8_t  scales_l[QK_K/64];
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
+
+// R4X-V2 D32A3: 32 values, fp16 scale, 32 packed 3-bit codes (Lloyd-Max levels) = 14 bytes
+#define QK_D32A3 32
+typedef struct {
+    ggml_half d;       // scale (least-squares fitted, stored as binary16)
+    uint8_t qs[12];    // 32 x 3-bit codes, little-endian bit order
+} block_d32a3;
+static_assert(sizeof(block_d32a3) == 14, "wrong d32a3 block size/padding");
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
 #endif // GGML_COMMON_DECL
