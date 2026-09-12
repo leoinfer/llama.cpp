@@ -25,9 +25,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # The MTP block is a real inference path, not training-only: vLLM publishes
+    # a concrete Qwen4Exp AMD MTP graph. transformers discards the weights via
+    # _keys_to_ignore_on_load_unexpected = [r"^mtp.*"], which is why this was
+    # previously disabled. Export is opt-in (mtp_only / no_mtp still gate it).
+    supports_mtp_export = True
+    no_mtp = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -120,6 +123,13 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
+        # --- MTP block -------------------------------------------------
+        # The MTP layer mirrors a main decoder layer, so its per-layer tensors
+        # reuse the main layer's mapping at the MTP block id. Only the fusion
+        # and mixer tensors are unique to MTP.
+        if name.startswith("mtp."):
+            return self._map_mtp_tensor(data_torch, name, bid)
+
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
             n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
@@ -139,6 +149,47 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return [(self.map_tensor_name(name), data_torch.squeeze())]
 
         return super().modify_tensors(data_torch, name, bid)
+
+    def _mtp_block_id(self) -> int:
+        """Block id of the MTP layer: one past the main stack."""
+        return int(self.hparams["num_hidden_layers"])
+
+    _MTP_MIXER = {
+        "hc_norm.weight":        "NEXTN_HC_MIXER_NORM",
+        "input_mix_weight_down.weight": "NEXTN_HC_MIXER_DOWN",
+        "input_mix_weight_up.weight":   "NEXTN_HC_MIXER_UP",
+    }
+    _MTP_HEAD = {
+        "fc_embedding.weight":           "NEXTN_FC_EMBEDDING",
+        "fc_hidden.weight":              "NEXTN_FC_HIDDEN",
+        "pre_fc_norm_embedding.weight":  "NEXTN_PRE_FC_NORM_EMBEDDING",
+        "pre_fc_norm_hidden.weight":     "NEXTN_PRE_FC_NORM_HIDDEN",
+    }
+
+    def _map_mtp_tensor(self, data_torch, name: str, bid):
+        """Map one `mtp.*` source tensor to its GGUF name."""
+        rest = name[len("mtp."):]
+
+        # MTP head-level fusion tensors and the HCMixer
+        if rest in self._MTP_HEAD:
+            t = getattr(gguf.MODEL_TENSOR, self._MTP_HEAD[rest])
+            return [(self.format_tensor_name(t), data_torch)]
+        if rest.startswith("hyper_connection_mixer."):
+            suffix = rest[len("hyper_connection_mixer."):]
+            if suffix not in self._MTP_MIXER:
+                raise ValueError(f"unhandled MTP mixer tensor: {name}")
+            t = getattr(gguf.MODEL_TENSOR, self._MTP_MIXER[suffix])
+            return [(self.format_tensor_name(t), data_torch)]
+
+        # Per-layer tensors: rewrite to the main layer prefix at the MTP block id
+        # and reuse the main mapping, so shapes/quirks (indexer split, norm gain,
+        # expert stacks) are handled exactly once.
+        prefix = "layers.0."
+        if not rest.startswith(prefix):
+            raise ValueError(f"unhandled MTP tensor: {name}")
+        main_name = ("model.language_model.layers."
+                     f"{self._mtp_block_id()}." + rest[len(prefix):])
+        return super().modify_tensors(data_torch, main_name, self._mtp_block_id())
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time
