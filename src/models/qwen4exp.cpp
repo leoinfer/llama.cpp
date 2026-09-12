@@ -341,6 +341,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        GGML_ASSERT(has_mtp && "MTP graph requested but the MTP block was not loaded");
+        return std::make_unique<graph>(*this, params, /*mtp_only=*/true);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -444,6 +448,115 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // ---- MTP draft block -------------------------------------------------
+    // One full-attention decoder layer plus the fusion/mixer pair, reproducing
+    // mtp_forward(). The trunk is not built at all here: res->t_logits is the
+    // draft head's logits and res->t_h_nextn is the 4-stream hidden that chains
+    // into the next draft step.
+    if (mtp_only) {
+        const int il_mtp = (int) hparams.n_layer();
+        const auto & layer = model.layers[il_mtp];
+
+        GGML_ASSERT(model.mtp_fc_embedding && "MTP: nextn.fc_embedding is missing");
+
+        const int64_t nt      = n_tokens;
+        const int64_t hc_dim  = hc * n_embd;
+        const int64_t n_embd_out = hparams.n_embd_out();
+        GGML_ASSERT(n_embd_out == hc_dim);
+
+        // Inputs. `tokens` supplies the previous token (embedded through the base
+        // table -- the MTP segment has no embedding table of its own), and `h`
+        // carries the target's pre-final-mixer 4-stream hidden. The driver fills
+        // both: batch.token holds the token id and batch.embd holds pending_h.
+        auto inp_mtp = std::make_unique<llm_graph_input_embd_h>(n_embd_out);
+
+        inp_mtp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nt);
+        ggml_set_input(inp_mtp->tokens);
+
+        // unused on the token path, but set_input() dereferences it off that path
+        inp_mtp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_out, nt);
+        ggml_set_input(inp_mtp->embd);
+
+        inp_mtp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_out, nt);
+        ggml_set_input(inp_mtp->h);
+        ggml_set_name(inp_mtp->h, "mtp_h_input");
+
+        ggml_tensor * y_prev = ggml_get_rows(ctx0, model.tok_embd, inp_mtp->tokens);
+        cb(y_prev, "mtp_tok_embd", il_mtp);
+
+        ggml_tensor * h_in = inp_mtp->h;
+        res->add_input(std::move(inp_mtp));
+
+        // e = fc_embedding(rms_norm(y_prev))            [n_embd, nt]
+        ggml_tensor * e = build_norm(y_prev, model.mtp_pre_fc_norm_embedding, nullptr, LLM_NORM_RMS, il_mtp);
+        e = build_lora_mm(model.mtp_fc_embedding, e);
+        cb(e, "mtp_e", il_mtp);
+
+        // h_n = fc_hidden(rms_norm(h)) applied PER HC BRANCH:
+        // reshape [hc_dim, nt] -> [n_embd, hc, nt] so ggml_rms_norm reduces over
+        // one stream, then flatten to [n_embd, hc*nt] so one matmul hits each
+        // branch. Scaling by the [hc_dim] gamma after the reshape is the grouped
+        // norm the reference does with group_size=hidden_size.
+        ggml_tensor * hn = ggml_reshape_3d(ctx0, h_in, n_embd, hc, nt);
+        hn = ggml_rms_norm(ctx0, hn, hparams.f_norm_rms_eps);
+        hn = ggml_reshape_2d(ctx0, hn, hc_dim, nt);
+        hn = ggml_mul(ctx0, hn, model.mtp_pre_fc_norm_hidden);
+        hn = ggml_reshape_2d(ctx0, hn, n_embd, hc * nt);
+        ggml_tensor * hf = build_lora_mm(model.mtp_fc_hidden, hn);
+        ggml_tensor * fused = ggml_reshape_3d(ctx0, hf, n_embd, hc, nt);
+        cb(fused, "mtp_fc_hidden", il_mtp);
+
+        // fused = h + e, the embedding residual broadcast to every branch
+        ggml_tensor * e3 = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, e, n_embd, 1, nt), n_embd, hc, nt, 1);
+        fused = ggml_add(ctx0, fused, e3);
+        cb(fused, "mtp_fused", il_mtp);
+
+        // --- the draft layer, identical to the trunk loop body -------------
+        ggml_tensor * inject = nullptr;
+        ggml_tensor * cur = build_hc_mix(fused,
+                layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up,
+                layer.hc_attn_inject, &inject, il_mtp);
+        ggml_build_forward_expand(gf, cur);
+
+        // always full attention: mtp.layer_types == ["full_attention"]
+        cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il_mtp);
+        cb(cur, "mtp_attn_out", il_mtp);
+
+        fused = build_hc_combine(fused, cur, inject, il_mtp);
+
+        cur = build_hc_mix(fused,
+                layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up,
+                layer.hc_ffn_inject, &inject, il_mtp);
+        cur = build_layer_ffn(cur, il_mtp);
+        cb(cur, "mtp_ffn_out", il_mtp);
+
+        fused = build_hc_combine(fused, cur, inject, il_mtp);
+        cb(fused, "mtp_multi", il_mtp);
+
+        // The chained hidden is the PRE-mixer 4-stream residual, captured before
+        // the final build_hc_mix. This is what the next draft step consumes as
+        // hidden_4stream, and it is what get_embeddings_nextn_ith reads back at
+        // width n_embd_out().
+        ggml_tensor * multi = ggml_reshape_2d(ctx0, fused, hc_dim, nt);
+        cb(multi, "h_nextn", -1);
+        res->t_h_nextn = multi;
+
+        // sample hidden: the mixer collapses the 4 streams (use_combine=false)
+        ggml_tensor * sample = build_hc_mix(fused,
+                model.mtp_hc_mixer_norm, model.mtp_hc_mixer_down, model.mtp_hc_mixer_up,
+                nullptr, nullptr, -1);
+        cb(sample, "result_norm", -1);
+        res->t_embd = sample;
+
+        // the draft head shares the base LM head -- nextn has no head of its own
+        ggml_tensor * logits = build_lora_mm(model.output, sample, model.output_s);
+        cb(logits, "result_output", -1);
+        res->t_logits = logits;
+        ggml_build_forward_expand(gf, logits);
+        return;
+    }
+
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
         ple_emb = build_inp_ple(mctx_hyb);
@@ -480,7 +593,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        // MTP needs the pre-final-mixer hidden at EVERY verified position, not just the
+        // sampled ones, so the gather is deferred when the target context is unmasked.
+        // This mirrors qwen35 and matches get_embeddings_nextn_ith, which indexes the
+        // unmasked rows densely by raw token position.
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -506,6 +623,16 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+    }
+
+    // Publish the pre-final-mixer 4-stream hidden for the MTP draft head. Row width
+    // is n_embd_out() == hc * n_embd, which is what get_embeddings_nextn_ith reads
+    // and what mtp_forward takes as `hidden_4stream`. Set BEFORE the out_ids gather
+    // so the chained draft sees every row.
+    {
+        ggml_tensor * multi = ggml_reshape_2d(ctx0, res_hc, hc* n_embd, res_hc->ne[2]);
+        cb(multi, "h_nextn", -1);
+        res->t_h_nextn = multi;
     }
 
     // the final mixer is the output norm: there is no separate one
