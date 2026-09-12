@@ -114,6 +114,11 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
     }
 
+    // a cache with no state layer carries sequence bookkeeping only
+    stores_state =
+        std::any_of(r_l.begin(), r_l.end(), [](const ggml_tensor * t) { return t != nullptr; }) ||
+        std::any_of(p_l.begin(), p_l.end(), [](const ggml_tensor * t) { return t != nullptr; });
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
@@ -190,23 +195,26 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // suffix removal: the part of the sequence at and beyond p0 goes away
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                const llama_pos rollback = cell.pos - (p0 - 1);
-                // pending rollback is single-use
-                const bool pending = rs_idx[seq_id] != 0;
-                // TEMP DIAGNOSTIC (remove once the refusal is understood)
-                LLAMA_LOG_WARN("%s: DIAG seq=%d p0=%d p1=%d cell.pos=%d rollback=%d "
-                               "pending=%d rs_idx=%u n_rs_seq=%u size=%u\n",
-                               __func__, (int) seq_id, (int) p0, (int) p1,
-                               (int) cell.pos, (int) rollback, (int) pending,
-                               (unsigned) rs_idx[seq_id], (unsigned) n_rs_seq, (unsigned) size);
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    set_rs_idx(seq_id, (uint32_t) rollback);
+                // A cache that stores no state cannot roll anything back: it has empty
+                // snapshot planes and no graph node reads its recurrent input, so `s_copy`
+                // never runs and a staged rollback would stay pending forever, refusing
+                // every later removal of that sequence. The state of every position below
+                // p0 is still valid as it stands, so a rewind of the tail is the removal.
+                if (!stores_state) {
                     cell.pos = p0 - 1;
-                    return true;
+                } else {
+                    const llama_pos rollback = cell.pos - (p0 - 1);
+                    // pending rollback is single-use
+                    const bool pending = rs_idx[seq_id] != 0;
+                    if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                        set_rs_idx(seq_id, (uint32_t) rollback);
+                        cell.pos = p0 - 1;
+                        return true;
+                    }
+                    return false;
                 }
-                return false;
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {

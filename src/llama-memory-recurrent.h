@@ -73,6 +73,11 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // false when the layer filter selected no layer at all (e.g. the recurrent half of a
+    // hybrid MTP draft context): the cache is then pure per-seq cell bookkeeping and holds
+    // no state that a partial removal could roll back
+    bool stores_state = false;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
