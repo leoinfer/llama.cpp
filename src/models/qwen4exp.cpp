@@ -550,6 +550,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(sample, "result_norm", -1);
         res->t_embd = sample;
 
+        // Select the output rows BEFORE the head, exactly as the trunk does. Besides
+        // being the right shape for logits, this is what keeps inp_out_ids referenced:
+        // build_inp_out_ids() is called for every graph, and an input no node reaches
+        // is never allocated, so set_inputs would touch a bufferless tensor.
+        if (inp_out_ids) {
+            sample = ggml_get_rows(ctx0, sample, inp_out_ids);
+        }
+
         // the draft head shares the base LM head -- nextn has no head of its own
         ggml_tensor * logits = build_lora_mm(model.output, sample, model.output_s);
         cb(logits, "result_output", -1);
