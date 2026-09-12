@@ -5074,6 +5074,10 @@ static void mix34_pack_group(const float * x, block_mix34 * y) {
         }
         gain[i] = e3 - e4;   // error saved by choosing IQ4_NL
     }
+    // The block layout is FIXED at 8 three-bit + 12 four-bit payloads (14 B and 18 B exactly fill
+    // 332 B), so exactly QK_MIX34_FOURBIT selector bits must be set. Choosing fewer would leave
+    // payload space that the decoder still reads, so the 12 largest gains are always taken even if
+    // some of them are non-positive.
     uint32_t selector = 0;
     for (int k = 0; k < QK_MIX34_FOURBIT; k++) {
         int best = -1;
@@ -5081,9 +5085,10 @@ static void mix34_pack_group(const float * x, block_mix34 * y) {
             if ((selector >> i) & 1u) continue;
             if (best < 0 || gain[i] > gain[best]) best = i;
         }
-        if (best < 0 || gain[best] <= 0.0) break;
+        assert(best >= 0);
         selector |= (1u << best);
     }
+    assert(__builtin_popcount(selector) == QK_MIX34_FOURBIT);
     y->selector = selector;
     uint8_t * p3 = y->payload;
     uint8_t * p4 = y->payload + 8*14;

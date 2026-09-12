@@ -9349,6 +9349,7 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
 }
 
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
+    if (src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PROBE")) { ggml_vk_mix34_probe("largeN_plain"); }
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -9703,6 +9704,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
+    if (src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PROBE")) { ggml_vk_mix34_probe("dmmv_plain"); }
     const ggml_tensor * src1 = dst->src[1];
 
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -9755,10 +9757,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     // Check for mmq first
     vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, ne11, ne20, ne00) : nullptr;
     if (dmmv != nullptr && src0->type == GGML_TYPE_D32A3 && getenv("GGML_VK_D32A3_PROBE")) {
-        ggml_vk_mix34_probe("mul_mat_vec");
-    }
-if (dmmv != nullptr && src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PROBE")) {
-        ggml_vk_mix34_probe("mul_mat_vec");
+        ggml_vk_d32a3_probe("mul_mat_vec");
     }
     vk_pipeline to_q8_1 = nullptr;
 
@@ -9777,10 +9776,7 @@ if (dmmv != nullptr && src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PR
     }
 
     if (dmmv != nullptr && src0->type == GGML_TYPE_D32A3 && getenv("GGML_VK_D32A3_PROBE")) {
-        ggml_vk_mix34_probe("mul_mat_vec_id");
-    }
-if (dmmv != nullptr && src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PROBE")) {
-        ggml_vk_mix34_probe("mul_mat_vec_id");
+        ggml_vk_d32a3_probe("mul_mat_vec_id");
     }
 
     const bool qx_needs_dequant = x_non_contig;
@@ -9789,7 +9785,6 @@ if (dmmv != nullptr && src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PR
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
-    if (src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PROBE")) { ggml_vk_mix34_probe("largeN_generic_dequant_path"); }
     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
     GGML_ASSERT(dmmv != nullptr);
@@ -10362,6 +10357,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
 }
 
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    if (src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PROBE")) { ggml_vk_mix34_probe("largeN_id"); }
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -10729,6 +10725,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
+    if (src0->type == GGML_TYPE_MIX34 && getenv("GGML_VK_MIX34_PROBE")) { ggml_vk_mix34_probe("dmmv_id"); }
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * ids = dst->src[2];
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -11470,14 +11467,13 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
         return CONV_SHAPE_64x32;
     }
 }
-// R4X MIX34 dispatch probe (GGML_VK_MIX34_PROBE=1): proves the native mixed-codebook path runs on GPU.
+// R4X MIX34 dispatch probe (GGML_VK_MIX34_PROBE=1): proves which Vulkan family executes MIX34.
+// One line per family on first use (plus every 1000th), so a token sweep yields a dispatch matrix.
 static void ggml_vk_mix34_probe(const char * op) {
-    static int n = 0;
-    n++;
-    if (n == 1) {
-        GGML_LOG_INFO("ggml_vulkan: MIX34 native dispatch engaged (%s)\n", op);
-    } else if (n % 1000 == 0) {
-        GGML_LOG_INFO("ggml_vulkan: MIX34 native dispatches so far: %d (%s)\n", n, op);
+    static std::map<std::string, int> counts;
+    const int n = ++counts[op];
+    if (n == 1 || n % 1000 == 0) {
+        GGML_LOG_INFO("ggml_vulkan: MIX34 native dispatch: %s (count=%d)\n", op, n);
     }
 }
 

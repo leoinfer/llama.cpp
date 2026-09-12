@@ -51,22 +51,39 @@ float mix34_scale(const uint ibi, const uint off) {
     return unpackHalf2x16(uint(data_a[ibi].payload[off >> 1])).x;
 }
 
-void calc_block(const uint a_offset, const uint b_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
-    const uint y_idx = i * QUANT_K;
+// Each MIX34 block holds 20 subblocks; handing a whole block to one thread would leave most of the
+// workgroup idle (a row is only p.ncols/640 blocks wide). A block is therefore split into
+// MIX34_SPLIT slices of MIX34_SUBS_PER_SLICE subblocks, and the slice's payload offsets come from the
+// selector's popcount below the slice start. Decoding semantics are unchanged.
+#define MIX34_SPLIT_NUM 20
+#define MIX34_SPLIT (MIX34_SPLIT_NUM + 0u)
+#define MIX34_SUBS_PER_SLICE (MIX34_SPLIT_NUM / MIX34_SPLIT_NUM * (MIX34_SPLIT_NUM / MIX34_SPLIT))
+#if (20 % MIX34_SPLIT_NUM) != 0
+#error "MIX34_SPLIT_NUM must divide the 20 subblocks per block, otherwise some subblocks are never decoded"
+#endif
 
-    uint ibi = a_offset + first_row * num_blocks_per_row + i;
+void calc_slice(const uint a_offset, const uint b_offset, const uint iblk, const uint slice,
+                const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint y_idx = iblk * QUANT_K;
+    const uint s0    = slice * MIX34_SUBS_PER_SLICE;
+    const uint s1    = s0 + MIX34_SUBS_PER_SLICE;
+
+    uint ibi = a_offset + first_row * num_blocks_per_row + iblk;
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint selector = data_a[ibi].selector;
+
+        // payload offsets at the start of the slice, from the selector bits below s0
+        const uint mask_below = (s0 == 0u) ? 0u : ((1u << s0) - 1u);
+        const uint n4_below   = bitCount(selector & mask_below);
+        uint off3 = 14u  * (s0 - n4_below);
+        uint off4 = 8u * 14u + 18u * n4_below;
 
         FLOAT_TYPE sum[NUM_COLS];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             sum[j] = FLOAT_TYPE(0);
         }
 
-        uint off3 = 0u;            // next D32A3 payload: 14 B each, in increasing subblock order
-        uint off4 = 8u * 14u;      // 112: next IQ4_NL payload, 18 B each, in increasing subblock order
-
-        for (uint s = 0; s < 20u; ++s) {
+        for (uint s = s0; s < s1; ++s) {
             FLOAT_TYPE sub[NUM_COLS];
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 sub[j] = FLOAT_TYPE(0);
@@ -107,8 +124,6 @@ void calc_block(const uint a_offset, const uint b_offset, const uint i, const ui
                     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                         const vec4 lo = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 4u*l) / 4u]);
                         const vec4 hi = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 16u + 4u*l) / 4u]);
-                        // byte 4l+m sits at bit offset 8m: its LOW nibble is the code for column
-                        // col + 4l + m and its HIGH nibble is the code for column col + 16 + 4l + m.
                         sub[j] = fma(FLOAT_TYPE(lo.x), FLOAT_TYPE(kvalues_iq4nl_sh[(w      ) & 0xFu]),
                                  fma(FLOAT_TYPE(lo.y), FLOAT_TYPE(kvalues_iq4nl_sh[(w >>  8) & 0xFu]),
                                  fma(FLOAT_TYPE(lo.z), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 16) & 0xFu]),
@@ -152,9 +167,10 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
-    // one full 640-value block per thread iteration
-    for (uint i = tid; i < num_blocks_per_row; i += gl_WorkGroupSize.x)
-        calc_block(a_offset, b_offset, i, num_blocks_per_row, first_row, num_rows);
+    // MIX34_SPLIT independent slices per block, so the workgroup stays busy with wide blocks
+    const uint num_tasks = num_blocks_per_row * MIX34_SPLIT;
+    for (uint t = tid; t < num_tasks; t += gl_WorkGroupSize.x)
+        calc_slice(a_offset, b_offset, t / MIX34_SPLIT, t % MIX34_SPLIT, num_blocks_per_row, first_row, num_rows);
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
