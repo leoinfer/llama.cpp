@@ -161,6 +161,25 @@ def main() -> int:
         ok = True
     checks.append(("an unknown MTP name raises rather than dropping", ok, ""))
 
+    # --- ordering invariant (the bug this test originally missed) ---------
+    # block_count must be bumped in __init__, NOT in set_gguf_parameters.
+    # base.set_gguf_parameters() writes add_block_count() and the arch override
+    # calls super() first, so a later assignment is silently ignored; and
+    # tensor_map is built from block_count, so blk.<n_layer>.* would not resolve.
+    import re as _re
+    init_body = src[src.index("def __init__(self, *args, **kwargs)"):]
+    init_body = init_body[:init_body.index("def set_gguf_parameters")]
+    sgp_body = src[src.index("def set_gguf_parameters"):]
+    sgp_body = sgp_body[:sgp_body.index("def ", 10)]
+    checks.append(("block_count bumped in __init__ (before add_block_count)",
+                   "self.block_count += mtp_layers" in init_body, ""))
+    checks.append(("tensor_map rebuilt after the bump",
+                   "get_tensor_name_map" in init_body, ""))
+    checks.append(("block_count NOT assigned in set_gguf_parameters",
+                   "self.block_count = n_layer" not in sgp_body, ""))
+    checks.append(("nextn metadata written in set_gguf_parameters",
+                   "add_nextn_predict_layers" in sgp_body, ""))
+
     # base model unaffected: the 1627 non-MTP tensors are untouched
     idx = json.loads((SOURCE / "model.safetensors.index.json").read_text())
     non_mtp = [k for k in idx["weight_map"] if not k.startswith("mtp.")]

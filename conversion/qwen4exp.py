@@ -34,6 +34,21 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # MTP: the draft block occupies one extra block id past the main stack.
+        # This MUST happen here rather than in set_gguf_parameters, because
+        # block_count is consumed twice before that runs:
+        #   1. base.set_gguf_parameters() calls add_block_count() with whatever
+        #      value is set at that point, and the arch's override calls super()
+        #      first -- so a later assignment would be ignored; and
+        #   2. tensor_map is built from block_count, so the MTP layer's
+        #      blk.<n_layer>.* names would not resolve at all.
+        # deepseek.py sets it in __init__ for exactly these reasons.
+        mtp_layers = int(self.hparams.get("mtp_num_hidden_layers") or 0)
+        if not self.no_mtp and mtp_layers:
+            self.block_count += mtp_layers
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
@@ -62,12 +77,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
         n_layer = hp["num_hidden_layers"]
 
-        # MTP: the draft block occupies one extra block id past the main stack.
-        # block_count must include it so the per-layer tensor names resolve, and
-        # the metadata key mirrors the NEXTN convention other archs use.
+        # block_count is already bumped in __init__ (see there for why). Only
+        # the metadata key is written here, mirroring the NEXTN convention.
         mtp_layers = hp.get("mtp_num_hidden_layers") or 0
         if not self.no_mtp and mtp_layers:
-            self.block_count = n_layer + int(mtp_layers)
             self.gguf_writer.add_nextn_predict_layers(int(mtp_layers))
 
         self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])

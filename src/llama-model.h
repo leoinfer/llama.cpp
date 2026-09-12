@@ -664,6 +664,18 @@ struct llama_model {
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;
     struct ggml_tensor * hc_head_up   = nullptr;
+
+    // qwen4exp MTP (multi-token prediction) head. These are OUTER tensors (no
+    // block index); the MTP layer's own per-layer tensors live at layer index
+    // hparams.n_layer() and reuse the main decoder-layer fields.
+    bool has_mtp = false;
+    struct ggml_tensor * mtp_fc_embedding           = nullptr;
+    struct ggml_tensor * mtp_fc_hidden              = nullptr;
+    struct ggml_tensor * mtp_pre_fc_norm_embedding  = nullptr;
+    struct ggml_tensor * mtp_pre_fc_norm_hidden     = nullptr;
+    struct ggml_tensor * mtp_hc_mixer_norm          = nullptr;
+    struct ggml_tensor * mtp_hc_mixer_down          = nullptr;
+    struct ggml_tensor * mtp_hc_mixer_up            = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
