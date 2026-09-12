@@ -69,6 +69,7 @@ const std::vector<std::string> type_names = {
     "iq3_xxs",
     "iq3_s",
     "iq4_xs",
+    "d32a3",
     "iq4_nl",
     "mxfp4",
     "nvfp4",
@@ -776,7 +777,7 @@ void process_shaders() {
     for (const auto& tname : type_names) {
         // mul mat vec
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
-        std::string shader = (string_ends_with(tname, "_k") || string_starts_with(tname, "iq1_") || string_starts_with(tname, "iq2_") || string_starts_with(tname, "iq3_") || tname == "iq4_xs" || tname == "tq2_0" || tname == "tq1_0") ? "mul_mat_vec_" + tname + ".comp" : "mul_mat_vec.comp";
+        std::string shader = (string_ends_with(tname, "_k") || string_starts_with(tname, "iq1_") || string_starts_with(tname, "iq2_") || string_starts_with(tname, "iq3_") || tname == "iq4_xs" || tname == "tq2_0" || tname == "tq1_0" || tname == "d32a3") ? "mul_mat_vec_" + tname + ".comp" : "mul_mat_vec.comp";
 
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
@@ -835,17 +836,6 @@ void process_shaders() {
             string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
         }
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
-
-        // R4X D32A3: generated explicitly (dequant + get_rows only). The type is not in
-        // `type_names` because it has no DMMV/coopmat/copy shaders yet.
-        if (tname == "iq4_nl") {
-            const std::map<std::string, std::string> d32a3_dict = {
-                {"A_TYPE", "block_d32a3"}, {"DATA_A_D32A3", "1"},
-            };
-            string_to_spv("dequant_d32a3", "dequant_d32a3.comp", merge_maps(base_dict, {{"A_TYPE", "block_d32a3"}, {"DATA_A_D32A3", "1"}, {"D_TYPE", "float16_t"}}));
-            string_to_spv("get_rows_d32a3", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {"A_TYPE", "block_d32a3"}, {"DATA_A_D32A3", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
-            string_to_spv("get_rows_d32a3_f32", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {"A_TYPE", "block_d32a3"}, {"DATA_A_D32A3", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
-        }
     }
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});

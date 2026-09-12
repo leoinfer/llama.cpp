@@ -479,15 +479,21 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 
 #if defined(DATA_A_D32A3)
 const float kvalues_d32a3[8] = float[8](-2.151945, -1.343910, -0.756005, -0.245094, 0.245094, 0.756005, 1.343910, 2.151945);
-vec2 dequantize(uint ib, uint iqs, uint a_offset) {
-    const uint bit   = 6u*iqs;                       // one iqs covers two 3-bit codes
+// 3-bit code for column `col` of block `ib` (96-bit little-endian payload)
+uint d32a3_code(uint ib, uint col, uint a_offset) {
+    const uint bit   = 3u*col;
     const uint byte0 = bit >> 3;
     const uint shift = bit & 7;
     uint w = uint(data_a[a_offset + ib].qs[byte0]);
     if (byte0 + 1 < 12) { w |= uint(data_a[a_offset + ib].qs[byte0 + 1]) << 8; }
     if (byte0 + 2 < 12) { w |= uint(data_a[a_offset + ib].qs[byte0 + 2]) << 16; }
-    const float d = float(data_a[a_offset + ib].d);
-    return vec2(d * kvalues_d32a3[(w >> shift) & 7], d * kvalues_d32a3[(w >> (shift + 3)) & 7]);
+    return (w >> shift) & 7u;
+}
+// The generic shaders expect IQ4_NL-style pairing: v.x is written at column `iqs`,
+// v.y at column `iqs + QUANT_K/2`. Values are returned UNSCALED; get_dm() supplies the scale.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(kvalues_d32a3[d32a3_code(ib, iqs,               a_offset)],
+                kvalues_d32a3[d32a3_code(ib, iqs + QUANT_K/2,   a_offset)]);
 }
 #endif
 
