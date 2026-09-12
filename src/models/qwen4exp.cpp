@@ -540,6 +540,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // width n_embd_out().
         ggml_tensor * multi = ggml_reshape_2d(ctx0, fused, hc_dim, nt);
         cb(multi, "h_nextn", -1);
+        ggml_build_forward_expand(gf, multi);
         res->t_h_nextn = multi;
 
         // sample hidden: the mixer collapses the 4 streams (use_combine=false)
@@ -635,8 +636,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // and what mtp_forward takes as `hidden_4stream`. Set BEFORE the out_ids gather
     // so the chained draft sees every row.
     if (cparams.embeddings_nextn) {
+        // The reshape is a NEW node that nothing else references, so it must be
+        // expanded into the graph explicitly. Assigning t_h_nextn alone is not
+        // enough: the graph marks t_h_nextn as an output, and an output node that
+        // was never expanded has no buffer, which surfaces much later as a bare
+        // GGML_ASSERT(buffer) in ggml_backend_buffer_get_type.
         ggml_tensor * multi = ggml_reshape_2d(ctx0, res_hc, hc* n_embd, res_hc->ne[2]);
         cb(multi, "h_nextn", -1);
+        ggml_build_forward_expand(gf, multi);
         res->t_h_nextn = multi;
     }
 

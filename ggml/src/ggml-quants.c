@@ -5050,6 +5050,81 @@ void quantize_row_d32a3_ref(const float * GGML_RESTRICT x, block_d32a3 * GGML_RE
     }
 }
 
+
+// ============================ R4X MIX34 (v1.g) ============================
+// 640 values per block: 20 subblocks of 32. Each subblock is encoded with BOTH component codecs
+// (D32A3 14 B, IQ4_NL 18 B, both existing authorities); the 12 subblocks with the largest error
+// reduction (E_d32a3 - E_iq4nl) are stored as IQ4_NL, the other 8 as D32A3. The selector records
+// which is which. Selector objective is FROZEN: greedy top-12 by error reduction, ties by index.
+static void mix34_pack_group(const float * x, block_mix34 * y) {
+    block_d32a3 b3[20];
+    block_iq4_nl b4[20];
+    float d3[20][32], d4[20][32];
+    double gain[20];
+    for (int i = 0; i < 20; i++) {
+        quantize_row_d32a3_ref  (x + 32*i, &b3[i], 32);
+        quantize_row_iq4_nl_ref (x + 32*i, &b4[i], 32);
+        dequantize_row_d32a3(&b3[i], d3[i], 32);
+        dequantize_row_iq4_nl(&b4[i], d4[i], 32);
+        double e3 = 0.0, e4 = 0.0;
+        for (int j = 0; j < 32; j++) {
+            const double t = x[32*i + j];
+            const double a = d3[i][j] - t, b = d4[i][j] - t;
+            e3 += a*a; e4 += b*b;
+        }
+        gain[i] = e3 - e4;   // error saved by choosing IQ4_NL
+    }
+    uint32_t selector = 0;
+    for (int k = 0; k < QK_MIX34_FOURBIT; k++) {
+        int best = -1;
+        for (int i = 0; i < 20; i++) {
+            if ((selector >> i) & 1u) continue;
+            if (best < 0 || gain[i] > gain[best]) best = i;
+        }
+        if (best < 0 || gain[best] <= 0.0) break;
+        selector |= (1u << best);
+    }
+    y->selector = selector;
+    uint8_t * p3 = y->payload;
+    uint8_t * p4 = y->payload + 8*14;
+    for (int i = 0; i < 20; i++) {
+        if ((selector >> i) & 1u) { memcpy(p4, &b4[i], 18); p4 += 18; }
+        else                      { memcpy(p3, &b3[i], 14); p3 += 14; }
+    }
+}
+
+void quantize_row_mix34_ref(const float * GGML_RESTRICT x, block_mix34 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MIX34 == 0);
+    for (int64_t i = 0; i < k/QK_MIX34; i++) mix34_pack_group(x + i*QK_MIX34, y + i);
+}
+
+void dequantize_row_mix34(const block_mix34 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MIX34 == 0);
+    for (int64_t g = 0; g < k/QK_MIX34; g++) {
+        const block_mix34 * b = x + g;
+        const uint8_t * p3 = b->payload;
+        const uint8_t * p4 = b->payload + 8*14;
+        for (int i = 0; i < 20; i++) {
+            float out[32];
+            if ((b->selector >> i) & 1u) { dequantize_row_iq4_nl((const block_iq4_nl *) p4, out, 32); p4 += 18; }
+            else                         { dequantize_row_d32a3 ((const block_d32a3 *)  p3, out, 32); p3 += 14; }
+            memcpy(y + g*QK_MIX34 + 32*i, out, 32*sizeof(float));
+        }
+    }
+}
+
+size_t quantize_mix34(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void) imatrix;
+    assert(n_per_row % QK_MIX34 == 0);
+    const int64_t nb = n_per_row / QK_MIX34;
+    for (int64_t r = 0; r < nrows; r++) {
+        for (int64_t g = 0; g < nb; g++) {
+            mix34_pack_group(src + r*n_per_row + g*QK_MIX34, (block_mix34 *) dst + r*nb + g);
+        }
+    }
+    return (size_t) nrows * nb * sizeof(block_mix34);
+}
+
 size_t quantize_d32a3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void) imatrix;
     const int64_t n = nrows * n_per_row;

@@ -1102,7 +1102,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // An input that no node in the graph references is never allocated, so its
+    // buffer stays null. That is a legitimate state, not an error: a draft block
+    // that is full attention builds the hybrid input for its attention half but
+    // never touches the recurrent half, so s_copy has nothing to carry. Reading
+    // it otherwise asserts in ggml_backend_buffer_is_host with no useful clue.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1125,7 +1130,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy == nullptr || inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -1146,7 +1151,12 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // An input that no node in the graph references is never allocated, so its
+    // buffer stays null. That is a legitimate state, not an error: a draft block
+    // that is full attention builds the hybrid input for its attention half but
+    // never touches the recurrent half, so s_copy has nothing to carry. Reading
+    // it otherwise asserts in ggml_backend_buffer_is_host with no useful clue.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1168,7 +1178,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy == nullptr || inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -1220,7 +1230,12 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // An input that no node in the graph references is never allocated, so its
+    // buffer stays null. That is a legitimate state, not an error: a draft block
+    // that is full attention builds the hybrid input for its attention half but
+    // never touches the recurrent half, so s_copy has nothing to carry. Reading
+    // it otherwise asserts in ggml_backend_buffer_is_host with no useful clue.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1256,7 +1271,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy == nullptr || inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;

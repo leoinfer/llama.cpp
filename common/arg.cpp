@@ -2422,6 +2422,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--load-mtp"},
+        "load the MTP/nextn draft head when the artifact carries one (default: do not load it)",
+        [](common_params & params) {
+            params.load_mtp = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

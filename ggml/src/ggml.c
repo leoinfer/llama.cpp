@@ -869,6 +869,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_d32a3,
         .from_float_ref           = (ggml_from_float_t) quantize_row_d32a3_ref,
     },
+    [GGML_TYPE_MIX34] = {
+        .type_name                = "mix34",
+        .blck_size                = QK_MIX34,
+        .type_size                = sizeof(block_mix34),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mix34,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_mix34_ref,
+    },
     [GGML_TYPE_IQ4_NL] = {
         .type_name                = "iq4_nl",
         .blck_size                = QK4_NL,
@@ -8085,6 +8093,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_D32A3:   result = quantize_d32a3  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_MIX34:   result = quantize_mix34  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);
