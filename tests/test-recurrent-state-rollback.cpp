@@ -603,15 +603,18 @@ static bool test_transaction_parity(const common_params & params, llama_model * 
     float diff_max = 0.0f;
     float state_max = 0.0f;
 
-    // pattern: (n_tail, accept) with accept < n_tail, i.e. always a rejected suffix.
-    // the non-repeated run isolates each case on its own context pair; the repeated run
-    // chains mixed transactions on one pair, which is where a leak would accumulate
+    // pattern: (n_tail, accept); accept < n_tail is a rejected suffix, accept == n_tail is
+    // a full accept where nothing is removed at all. The non-repeated run isolates each case
+    // on its own context pair; the repeated run chains mixed transactions on one pair,
+    // which is where a leak would accumulate
     std::vector<std::pair<uint32_t, uint32_t>> plan;
     if (repeats) {
         plan = { {3, 1}, {2, 0}, {1, 0}, {3, 2}, {3, 0}, {2, 1}, {3, 1}, {1, 0} };
     } else {
         for (uint32_t n_tail = 1; n_tail <= n_rs; ++n_tail) {
-            for (uint32_t accept = 0; accept < n_tail; ++accept) {
+            // every rejected suffix length, plus the full accept (accept == n_tail, where
+            // no removal happens at all and the only difference is batch shape)
+            for (uint32_t accept = 0; accept <= n_tail; ++accept) {
                 plan.emplace_back(n_tail, accept);
             }
         }
@@ -655,9 +658,12 @@ static bool test_transaction_parity(const common_params & params, llama_model * 
         ok = ok && decode_rows(ctx_txn, tokens, pos, n_prefix, false) &&
                    decode_rows(ctx_ref, tokens, pos, n_prefix, false);
 
-        // the transaction: speculative tail, then remove the rejected suffix
+        // the transaction: speculative tail, then remove the rejected suffix (nothing to
+        // remove when the whole batch was accepted)
         ok = ok && decode_rows(ctx_txn, tokens, pos_tail, n_tail, false);
-        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_txn), 0, p0, -1);
+        if (accept < n_tail) {
+            ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_txn), 0, p0, -1);
+        }
 
         // the reference is the serial world: it decodes the accepted tokens one at a time
         for (llama_pos p = pos_tail; ok && p < p0; ++p) {
@@ -751,13 +757,6 @@ static bool test_transaction_parity(const common_params & params, llama_model * 
             ok = ok && decode_one(ctx_r, tokens[p], p);
         }
 
-        if (ok) {
-            byte_collector b_c, b_r;
-            llama_get_memory(ctx_c)->state_write(b_c);
-            llama_get_memory(ctx_r)->state_write(b_r);
-            control_state = max_state_diff(b_c, b_r);
-        }
-
         std::vector<float> la, lb;
         for (uint32_t i = 0; ok && i < n_cont; ++i) {
             const llama_pos p = p0 + (llama_pos) i;
@@ -766,6 +765,14 @@ static bool test_transaction_parity(const common_params & params, llama_model * 
             if (ok) {
                 control_logit = std::max(control_logit, max_logit_diff(la, lb));
             }
+        }
+
+        // the dumps only line up cell for cell once both decoded the same number of tokens
+        if (ok) {
+            byte_collector b_c, b_r;
+            llama_get_memory(ctx_c)->state_write(b_c);
+            llama_get_memory(ctx_r)->state_write(b_r);
+            control_state = max_state_diff(b_c, b_r);
         }
 
         llama_free(ctx_c);
@@ -898,8 +905,23 @@ static bool test_restore_into_dirty(const common_params & params, llama_model * 
     llama_get_memory(ctx_dirty)->state_write(b_again);
     const bool again_equal = b_again.bytes == b_clean.bytes;
 
-    fprintf(stderr, "%s : %s (max logit diff %g, second restore identical to clean: %d)\n",
-            __func__, diff_max <= 1e-5f ? "PASS" : "DIFFERS", (double) diff_max, again_equal ? 1 : 0);
+    // and the source context itself, whose state was produced by its own decode rather than
+    // by a restore: this separates "a restore changes the numbers" from "dirtiness does"
+    std::vector<float> l_src, l_clean;
+    float diff_src = 0.0f;
+    for (uint32_t i = 0; i < n_rollback && ok; ++i) {
+        const llama_pos pos = rollback_pos + (llama_pos) i;
+        ok = decode_one(ctx_src, tokens[pos], pos) && decode_one(ctx_clean, tokens[pos], pos);
+        ok = ok && gather_logits(ctx_src, 0, n_vocab, l_src) && gather_logits(ctx_clean, 0, n_vocab, l_clean);
+        if (ok) {
+            diff_src = std::max(diff_src, max_logit_diff(l_src, l_clean));
+        }
+    }
+
+    fprintf(stderr, "%s : %s (clean vs dirty max logit diff %g, second restore identical: %d, "
+            "own-decode vs restored max logit diff %g)\n",
+            __func__, diff_max <= 1e-5f ? "PASS" : "DIFFERS", (double) diff_max, again_equal ? 1 : 0,
+            (double) diff_src);
 
     llama_free(ctx_src);
     llama_free(ctx_clean);
