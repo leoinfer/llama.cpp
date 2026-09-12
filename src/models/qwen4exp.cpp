@@ -597,7 +597,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // sampled ones, so the gather is deferred when the target context is unmasked.
         // This mirrors qwen35 and matches get_embeddings_nextn_ith, which indexes the
         // unmasked rows densely by raw token position.
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        // Gather unless the MTP target explicitly wants unmasked rows. The guard is
+        // `embeddings_nextn && !..._masked`, NOT `embeddings_nextn_masked`: the flag
+        // defaults to false, so gating on it alone would silently disable the gather
+        // for every ordinary run and change the graph for all generation.
+        const bool mtp_wants_all_rows = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+        if (il == n_layer - 1 && inp_out_ids && !mtp_wants_all_rows) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -629,7 +634,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // is n_embd_out() == hc * n_embd, which is what get_embeddings_nextn_ith reads
     // and what mtp_forward takes as `hidden_4stream`. Set BEFORE the out_ids gather
     // so the chained draft sees every row.
-    {
+    if (cparams.embeddings_nextn) {
         ggml_tensor * multi = ggml_reshape_2d(ctx0, res_hc, hc* n_embd, res_hc->ne[2]);
         cb(multi, "h_nextn", -1);
         res->t_h_nextn = multi;
