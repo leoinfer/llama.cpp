@@ -195,6 +195,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
+                // TEMP DIAGNOSTIC (remove once the refusal is understood)
+                LLAMA_LOG_WARN("%s: DIAG seq=%d p0=%d p1=%d cell.pos=%d rollback=%d "
+                               "pending=%d rs_idx=%u n_rs_seq=%u size=%u\n",
+                               __func__, (int) seq_id, (int) p0, (int) p1,
+                               (int) cell.pos, (int) rollback, (int) pending,
+                               (unsigned) rs_idx[seq_id], (unsigned) n_rs_seq, (unsigned) size);
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;

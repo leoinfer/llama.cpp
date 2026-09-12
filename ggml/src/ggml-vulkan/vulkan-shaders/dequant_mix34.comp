@@ -1,0 +1,65 @@
+#version 450
+
+// Dedicated MIX34 -> f16/f32 dequant (R4X MIX34 v1.g).
+//
+// The generic homogeneous dequant family cannot describe MIX34: each 32-value subblock is either
+// D32A3 (14 B payload) or IQ4_NL (18 B payload) according to a selector bit. This shader resolves the
+// selector per subblock and decodes accordingly. It exists so that the backend's large-N MUL_MAT /
+// MUL_MAT_ID path (which dequantizes src0 to f16 and then uses the generic f16 matmul) works for MIX34
+// instead of being unsupported - prompt prefill needs exactly that path.
+//
+// Payload offsets are derived here from the selector popcount, independently of the mat-vec shader,
+// which walks the same two regions with running offsets. Both must agree with the CPU decoder:
+//   D32A3 payloads fill [0, 112) in subblock order (14 B each),
+//   IQ4_NL payloads fill [112, 332) in subblock order (18 B each),
+//   the encoder guarantees exactly 12 selector bits are set.
+//   D32A3 : float16 d + 12 B of 32 three-bit codes, LSB-first, code k pairs with column k.
+//   IQ4_NL: float16 d + 16 B; column j < 16 is the LOW nibble of byte j, column j + 16 the HIGH nibble.
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_mix34 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+const float kd32a3_levels[8] = float[8](-2.151945, -1.343910, -0.756005, -0.245094, 0.245094, 0.756005, 1.343910, 2.151945);
+const float kiq4nl_levels[16] = float[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+uint mix34_payload_byte(const uint ib, const uint off) {
+    return uint(data_a[ib].payload[off >> 1] >> (8u * (off & 1u))) & 0xFFu;
+}
+
+// one invocation per MIX34 value
+void main() {
+    const uint v = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    if (v >= p.nel) {
+        return;
+    }
+    const uint ib  = v / QUANT_K_MIX34;
+    const uint k   = v % QUANT_K_MIX34;
+    const uint s   = k >> 5;          // subblock 0..19
+    const uint j   = k & 31u;         // value inside the subblock
+    const uint sel = data_a[ib].selector;
+    const uint is4 = (sel >> s) & 1u;
+    const uint n4  = bitCount(sel & ((1u << s) - 1u));   // IQ4_NL payloads before this subblock
+
+    if (is4 == 0u) {
+        const uint off = 14u * (s - n4);
+        const float d = unpackHalf2x16(uint(data_a[ib].payload[off >> 1])).x;
+        const uint bit = 3u * j;
+        const uint by  = off + 2u + (bit >> 3);
+        const uint sh  = bit & 7u;
+        uint w = mix34_payload_byte(ib, by);
+        if (sh != 0u) {
+            w |= mix34_payload_byte(ib, by + 1u) << 8;   // by+1 <= off+13 always
+        }
+        data_b[v] = D_TYPE(d * kd32a3_levels[(w >> sh) & 7u]);
+    } else {
+        const uint off = 8u * 14u + 18u * n4;
+        const float d = unpackHalf2x16(uint(data_a[ib].payload[off >> 1])).x;
+        const uint q  = mix34_payload_byte(ib, off + 2u + (j & 15u));
+        const uint code = (j < 16u) ? (q & 0xFu) : (q >> 4);
+        data_b[v] = D_TYPE(d * kiq4nl_levels[code]);
+    }
+}
