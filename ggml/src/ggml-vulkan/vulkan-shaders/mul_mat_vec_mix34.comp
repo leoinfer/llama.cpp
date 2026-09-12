@@ -97,7 +97,8 @@ void calc_block(const uint a_offset, const uint b_offset, const uint i, const ui
                 }
                 off3 += 14u;
             } else {
-                // IQ4_NL: byte 4l+m supplies column col + 4l + m (low nibble) and col + 16 + 4l + m (high).
+                // IQ4_NL: byte 4l+m supplies column col + 4l + m (low nibble) and column col + 16 + 4l + m
+                // (high nibble). The 32-bit word packs bytes 4l..4l+3 little-endian, so byte m lives at bit 8m.
                 const uint qs = off4 + 2u;
                 [[unroll]] for (uint l = 0; l < 4u; ++l) {
                     const uint o = qs + 4u * l;
@@ -106,13 +107,15 @@ void calc_block(const uint a_offset, const uint b_offset, const uint i, const ui
                     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                         const vec4 lo = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 4u*l) / 4u]);
                         const vec4 hi = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 16u + 4u*l) / 4u]);
+                        // byte 4l+m sits at bit offset 8m: its LOW nibble is the code for column
+                        // col + 4l + m and its HIGH nibble is the code for column col + 16 + 4l + m.
                         sub[j] = fma(FLOAT_TYPE(lo.x), FLOAT_TYPE(kvalues_iq4nl_sh[(w      ) & 0xFu]),
-                                 fma(FLOAT_TYPE(lo.y), FLOAT_TYPE(kvalues_iq4nl_sh[(w >>  4) & 0xFu]),
-                                 fma(FLOAT_TYPE(lo.z), FLOAT_TYPE(kvalues_iq4nl_sh[(w >>  8) & 0xFu]),
-                                 fma(FLOAT_TYPE(lo.w), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 12) & 0xFu]),
-                                 fma(FLOAT_TYPE(hi.x), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 16) & 0xFu]),
-                                 fma(FLOAT_TYPE(hi.y), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 20) & 0xFu]),
-                                 fma(FLOAT_TYPE(hi.z), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 24) & 0xFu]),
+                                 fma(FLOAT_TYPE(lo.y), FLOAT_TYPE(kvalues_iq4nl_sh[(w >>  8) & 0xFu]),
+                                 fma(FLOAT_TYPE(lo.z), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 16) & 0xFu]),
+                                 fma(FLOAT_TYPE(lo.w), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 24) & 0xFu]),
+                                 fma(FLOAT_TYPE(hi.x), FLOAT_TYPE(kvalues_iq4nl_sh[(w >>  4) & 0xFu]),
+                                 fma(FLOAT_TYPE(hi.y), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 12) & 0xFu]),
+                                 fma(FLOAT_TYPE(hi.z), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 20) & 0xFu]),
                                  fma(FLOAT_TYPE(hi.w), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 28) & 0xFu]),
                                  sub[j]))))))));
                     }

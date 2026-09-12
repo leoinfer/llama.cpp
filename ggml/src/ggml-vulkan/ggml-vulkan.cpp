@@ -8104,6 +8104,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_D32A3:
         case GGML_TYPE_MIX34:
+        if (getenv("GGML_VK_MIX34_PROBE")) { ggml_vk_mix34_probe("pipeline_lookup"); }
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
@@ -8193,6 +8194,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_D32A3:
         case GGML_TYPE_MIX34:
+        if (getenv("GGML_VK_MIX34_PROBE")) { ggml_vk_mix34_probe("pipeline_lookup"); }
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
