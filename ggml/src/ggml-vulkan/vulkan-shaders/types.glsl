@@ -1838,6 +1838,29 @@ struct block_iq4_nl_packed16
 #define A_TYPE_PACKED16 block_iq4_nl_packed16
 #endif
 
+#define QUANT_K_MIX34 640
+#define QUANT_R_MIX34 2
+
+// R4X MIX34 v1.g. Authority: ggml/src/ggml-quants.c quantize_row_mix34_ref / dequantize_row_mix34.
+// 640 values = 20 subblocks of 32. Selector bit s marks subblock s: 1 = IQ4_NL (18 B), 0 = D32A3 (14 B).
+// Payload order is the CPU's: D32A3 payloads fill [0, 112) in subblock order, then IQ4_NL payloads fill
+// [112, 332). The encoder guarantees exactly 12 selector bits are set. Declared as 16-bit words because
+// every payload scale lands on an even byte offset, so scale loads need no punning.
+//   D32A3 payload: float16 d (2 B) + 12 B = 32 three-bit codes LSB-first; code k pairs with column k.
+//   IQ4_NL payload: float16 d (2 B) + 16 B; column j < 16 = low nibble of byte j, column j + 16 = high nibble.
+struct block_mix34
+{
+    uint32_t selector;
+    uint16_t payload[164];
+};
+
+#if defined(DATA_A_MIX34)
+#define QUANT_K QUANT_K_MIX34
+#define QUANT_R QUANT_R_MIX34
+#define QUANT_AUXF 1
+#define A_TYPE block_mix34
+#endif
+
 #define QUANT_K_MXFP4 32
 #define QUANT_R_MXFP4 2
 

@@ -602,16 +602,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        // MTP needs the pre-final-mixer hidden at EVERY verified position, not just the
-        // sampled ones, so the gather is deferred when the target context is unmasked.
-        // This mirrors qwen35 and matches get_embeddings_nextn_ith, which indexes the
-        // unmasked rows densely by raw token position.
-        // Gather unless the MTP target explicitly wants unmasked rows. The guard is
-        // `embeddings_nextn && !..._masked`, NOT `embeddings_nextn_masked`: the flag
-        // defaults to false, so gating on it alone would silently disable the gather
-        // for every ordinary run and change the graph for all generation.
-        const bool mtp_wants_all_rows = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
-        if (il == n_layer - 1 && inp_out_ids && !mtp_wants_all_rows) {
+        if (il == n_layer - 1 && inp_out_ids) {
+            // MTP needs the pre-final-mixer hidden at EVERY verified position, not just
+            // the sampled ones, so publish it from the residual BEFORE the gather.
+            // Deferring the gather instead (as this originally did) is wrong twice
+            // over: the LM head would then score every row, and inp_out_ids would
+            // become an input no node references -- which is never allocated, so
+            // set_inputs would touch a null buffer and abort.
+            if (cparams.embeddings_nextn) {
+                ggml_tensor * multi = ggml_reshape_2d(ctx0, res_hc, hc* n_embd, res_hc->ne[2]);
+                cb(multi, "h_nextn", -1);
+                ggml_build_forward_expand(gf, multi);
+                res->t_h_nextn = multi;
+            }
+
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -643,17 +647,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // is n_embd_out() == hc * n_embd, which is what get_embeddings_nextn_ith reads
     // and what mtp_forward takes as `hidden_4stream`. Set BEFORE the out_ids gather
     // so the chained draft sees every row.
-    if (cparams.embeddings_nextn) {
-        // The reshape is a NEW node that nothing else references, so it must be
-        // expanded into the graph explicitly. Assigning t_h_nextn alone is not
-        // enough: the graph marks t_h_nextn as an output, and an output node that
-        // was never expanded has no buffer, which surfaces much later as a bare
-        // GGML_ASSERT(buffer) in ggml_backend_buffer_get_type.
-        ggml_tensor * multi = ggml_reshape_2d(ctx0, res_hc, hc* n_embd, res_hc->ne[2]);
-        cb(multi, "h_nextn", -1);
-        ggml_build_forward_expand(gf, multi);
-        res->t_h_nextn = multi;
-    }
+    // t_h_nextn was published in-loop from the pre-gather residual when the MTP
+    // target asked for it; the post-gather res_hc is the sampled rows only.
 
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
