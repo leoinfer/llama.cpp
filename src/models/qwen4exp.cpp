@@ -148,6 +148,28 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 }
 
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+    // --- MTP presence detection -----------------------------------------
+    // The MTP block is an OPTIONAL part of the artifact. Metadata declaring it
+    // is a promise, not a fact, so probe for the head tensors and compare.
+    // Section 43: a declared-but-absent MTP block must be a hard error. The
+    // failure this prevents is the quiet one -- a loader that silently drops
+    // MTP while the CLI/user believes it is enabled, which would make any
+    // later throughput number meaningless.
+    const bool mtp_declared = hparams.n_layer_nextn > 0;
+    const bool mtp_present  = ml.get_weight("nextn.fc_embedding.weight") != nullptr;
+    if (mtp_declared && ml.load_mtp && !mtp_present) {
+        throw std::runtime_error(format(
+            "metadata declares mtp_num_hidden_layers=%u but the MTP head tensors "
+            "(nextn.fc_embedding) are absent. Refusing to load with MTP requested "
+            "and unavailable: re-convert with MTP export enabled, or disable MTP "
+            "explicitly.", hparams.n_layer_nextn));
+    }
+    if (!mtp_declared && mtp_present) {
+        throw std::runtime_error(
+            "MTP head tensors are present but the model does not declare "
+            "nextn_predict_layers -- the artifact is inconsistent");
+    }
+
     LLAMA_LOAD_LOCALS;
 
     const int64_t hc     = hparams.dsv4_hc_mult;
