@@ -61,6 +61,15 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
 
         n_layer = hp["num_hidden_layers"]
+
+        # MTP: the draft block occupies one extra block id past the main stack.
+        # block_count must include it so the per-layer tensor names resolve, and
+        # the metadata key mirrors the NEXTN convention other archs use.
+        mtp_layers = hp.get("mtp_num_hidden_layers") or 0
+        if not self.no_mtp and mtp_layers:
+            self.block_count = n_layer + int(mtp_layers)
+            self.gguf_writer.add_nextn_predict_layers(int(mtp_layers))
+
         self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
         self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
