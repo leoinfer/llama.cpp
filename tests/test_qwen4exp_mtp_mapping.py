@@ -180,6 +180,29 @@ def main() -> int:
     checks.append(("nextn metadata written in set_gguf_parameters",
                    "add_nextn_predict_layers" in sgp_body, ""))
 
+    # --- per-layer metadata arrays must cover the MTP block ---------------
+    # Same bug class as the block_count ordering fix: an array sized by trunk
+    # layers only. The loader reads attn_compress_ratios with n_layer_all and
+    # HARD-FAILS on a length mismatch, so a 48-entry array against a 49-block
+    # model refuses to load at all. And if the length check were absent the
+    # failure would be quiet, because build_layer_attn keys QSA off
+    # `compress_ratios[il] > 0` -- a 0 would downgrade the draft block to dense
+    # attention and yield plausible but wrong drafts.
+    checks.append(("compress ratios cover the MTP block",
+                   "n_mtp_block = int(self.block_count) - int(n_layer)" in src, ""))
+    checks.append(("compress ratios reject an unsupported MTP layer type",
+                   'only full_attention is handled' in src, ""))
+
+    import json as _json
+    _hp = _json.loads((SOURCE / "config.json").read_text())["text_config"]
+    _nl = _hp["num_hidden_layers"]
+    _mtp = _hp.get("mtp_num_hidden_layers") or 0
+    for _no_mtp in (False, True):
+        _bc = _nl if _no_mtp else _nl + int(_mtp)
+        _n_ratios = _nl + (_bc - _nl)
+        checks.append((f"ratio length == block_count (no_mtp={_no_mtp})",
+                       _n_ratios == _bc, f"{_n_ratios} vs {_bc}"))
+
     # base model unaffected: the 1627 non-MTP tensors are untouched
     idx = json.loads((SOURCE / "model.safetensors.index.json").read_text())
     non_mtp = [k for k in idx["weight_map"] if not k.startswith("mtp.")]

@@ -277,6 +277,67 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
     }
+
+    // --- MTP draft block -------------------------------------------------
+    // The draft block is a single decoder layer stored at index n_layer()
+    // (== n_layer_all - n_layer_nextn). It is a FULL-attention layer: the
+    // config's mtp.layer_types is ["full_attention"], so the recurrent branch
+    // never applies and these shapes mirror the !is_recr branch above exactly.
+    //
+    // mtp_flags mirrors qwen35: a trunk-only load skips the whole block rather
+    // than failing, so the same GGUF serves both --mtp off and --mtp on.
+    if (hparams.n_layer_nextn > 0) {
+        const int mtp_flags = ml.load_mtp ? 0 : TENSOR_SKIP;
+        const int il_mtp    = (int) hparams.n_layer();
+        auto & layer = layers[il_mtp];
+
+        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
+        const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+
+        // two HC modules, identical shapes to a trunk layer
+        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il_mtp), { hc_dim }, mtp_flags);
+        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il_mtp), { hc_dim, hc_lr }, mtp_flags);
+        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il_mtp), { hc_lr, hc_dim }, mtp_flags);
+        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il_mtp), { hc_dim, hc }, mtp_flags);
+        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il_mtp), { hc_dim }, mtp_flags);
+        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il_mtp), { hc_dim, hc_lr }, mtp_flags);
+        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il_mtp), { hc_lr, hc_dim }, mtp_flags);
+        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il_mtp), { hc_dim, hc }, mtp_flags);
+
+        // full attention, including the q|gate interleave
+        create_tensor_qkv(layer, il_mtp, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il_mtp), { n_embd_head_k * n_head, n_embd }, mtp_flags);
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il_mtp), { n_embd_head_k }, mtp_flags);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il_mtp), { n_embd_head_k }, mtp_flags);
+
+        // QSA indexer
+        const int64_t idx_dim = hparams.indexer_head_size;
+        layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il_mtp), { n_embd, hparams.indexer_n_head * idx_dim }, mtp_flags);
+        layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il_mtp), { n_embd, idx_dim }, mtp_flags);
+        layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il_mtp), { idx_dim }, mtp_flags);
+        layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il_mtp), { idx_dim }, mtp_flags);
+
+        // MoE, same shapes as a trunk layer
+        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il_mtp), { n_embd, n_expert }, mtp_flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il_mtp), { n_ff_exp, n_embd, n_expert }, mtp_flags);
+        create_tensor_gate_up_exps(layer, il_mtp, n_embd, n_ff_exp, n_expert, mtp_flags);
+
+        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il_mtp), { n_embd }, mtp_flags);
+        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il_mtp), { n_embd, n_ff_shexp }, mtp_flags);
+        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il_mtp), { n_embd, n_ff_shexp }, mtp_flags);
+        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il_mtp), { n_ff_shexp, n_embd }, mtp_flags);
+
+        // the 7 MTP-unique OUTER tensors: no block index
+        mtp_fc_embedding          = create_tensor(tn(LLM_TENSOR_NEXTN_FC_EMBEDDING,          "weight"), { n_embd, n_embd }, mtp_flags);
+        mtp_fc_hidden             = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN,             "weight"), { n_embd, n_embd }, mtp_flags);
+        mtp_pre_fc_norm_embedding = create_tensor(tn(LLM_TENSOR_NEXTN_PRE_FC_NORM_EMBEDDING, "weight"), { n_embd },   mtp_flags);
+        mtp_pre_fc_norm_hidden    = create_tensor(tn(LLM_TENSOR_NEXTN_PRE_FC_NORM_HIDDEN,    "weight"), { hc_dim },   mtp_flags);
+        mtp_hc_mixer_norm         = create_tensor(tn(LLM_TENSOR_NEXTN_HC_MIXER_NORM,         "weight"), { hc_dim },   mtp_flags);
+        mtp_hc_mixer_down         = create_tensor(tn(LLM_TENSOR_NEXTN_HC_MIXER_DOWN,         "weight"), { hc_dim, hc_lr }, mtp_flags);
+        mtp_hc_mixer_up           = create_tensor(tn(LLM_TENSOR_NEXTN_HC_MIXER_UP,           "weight"), { hc_lr, hc_dim }, mtp_flags);
+
+        has_mtp = ml.load_mtp;
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
@@ -355,7 +416,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
-llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params, bool mtp_only) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
 

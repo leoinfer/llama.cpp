@@ -2260,7 +2260,28 @@ struct llama_model_qwen3next : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
-        graph(const llama_model & model, const llm_graph_params & params);
+        // mtp_only builds just the MTP draft block at layer n_layer() instead of
+        // the 48-layer trunk. The two share every helper, and most of the
+        // constructor's locals (inp, mctx_hyb, inp_pos, sections), so the draft
+        // path lives here rather than in a separate class.
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp_only = false);
+
+        // hyper-connection primitives, exposed so the MTP path can reuse them
+        ggml_tensor * build_hc_mix(
+                    ggml_tensor * x,
+                    ggml_tensor * w_norm,
+                    ggml_tensor * w_down,
+                    ggml_tensor * w_up,
+                    ggml_tensor * w_inject,
+                    ggml_tensor ** inject,
+                            int   il);
+
+        ggml_tensor * build_hc_combine(
+                    ggml_tensor * residual,
+                    ggml_tensor * block_out,
+                    ggml_tensor * inject,
+                            int   il);
+
     private:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
@@ -2305,7 +2326,28 @@ struct llama_model_qwen35 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
-        graph(const llama_model & model, const llm_graph_params & params);
+        // mtp_only builds just the MTP draft block at layer n_layer() instead of
+        // the 48-layer trunk. The two share every helper, and most of the
+        // constructor's locals (inp, mctx_hyb, inp_pos, sections), so the draft
+        // path lives here rather than in a separate class.
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp_only = false);
+
+        // hyper-connection primitives, exposed so the MTP path can reuse them
+        ggml_tensor * build_hc_mix(
+                    ggml_tensor * x,
+                    ggml_tensor * w_norm,
+                    ggml_tensor * w_down,
+                    ggml_tensor * w_up,
+                    ggml_tensor * w_inject,
+                    ggml_tensor ** inject,
+                            int   il);
+
+        ggml_tensor * build_hc_combine(
+                    ggml_tensor * residual,
+                    ggml_tensor * block_out,
+                    ggml_tensor * inject,
+                            int   il);
+
     private:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
@@ -2354,9 +2396,13 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
-        graph(const llama_model & model, const llm_graph_params & params);
-    private:
-        // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
+        // mtp_only builds just the MTP draft block at layer n_layer() instead of
+        // the 48-layer trunk. The two share every helper, and most of the
+        // constructor's locals (inp, mctx_hyb, inp_pos, sections), so the draft
+        // path lives here rather than in a separate class.
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp_only = false);
+
+        // hyper-connection primitives, exposed so the MTP path can reuse them
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
                     ggml_tensor * w_norm,
@@ -2372,6 +2418,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+    private:
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
@@ -2456,7 +2503,28 @@ struct llama_model_qwen35moe : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
-        graph(const llama_model & model, const llm_graph_params & params);
+        // mtp_only builds just the MTP draft block at layer n_layer() instead of
+        // the 48-layer trunk. The two share every helper, and most of the
+        // constructor's locals (inp, mctx_hyb, inp_pos, sections), so the draft
+        // path lives here rather than in a separate class.
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp_only = false);
+
+        // hyper-connection primitives, exposed so the MTP path can reuse them
+        ggml_tensor * build_hc_mix(
+                    ggml_tensor * x,
+                    ggml_tensor * w_norm,
+                    ggml_tensor * w_down,
+                    ggml_tensor * w_up,
+                    ggml_tensor * w_inject,
+                    ggml_tensor ** inject,
+                            int   il);
+
+        ggml_tensor * build_hc_combine(
+                    ggml_tensor * residual,
+                    ggml_tensor * block_out,
+                    ggml_tensor * inject,
+                            int   il);
+
     private:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,

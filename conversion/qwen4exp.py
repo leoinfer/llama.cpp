@@ -88,9 +88,30 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+
+        # One entry per BLOCK ID, not per trunk layer. The loader reads this array
+        # with n_layer_all and hard-fails on a length mismatch, so a 48-entry array
+        # against a 49-block model refuses to load. Missing the MTP entry would be
+        # quiet rather than loud if the length check were absent: build_layer_attn
+        # keys QSA off `dsv4_compress_ratios[il] > 0`, so a 0 silently downgrades
+        # the draft block to dense attention -- wrong drafts, no error.
+        n_mtp_block = int(self.block_count) - int(n_layer)
+        if n_mtp_block > 0:
+            mtp_types = (hp.get("mtp") or {}).get("layer_types") or ["full_attention"] * n_mtp_block
+            if len(mtp_types) != n_mtp_block:
+                raise ValueError(
+                    f"mtp.layer_types has {len(mtp_types)} entries but the model has "
+                    f"{n_mtp_block} MTP block(s)"
+                )
+            for lt in mtp_types:
+                if lt != "full_attention":
+                    raise ValueError(
+                        f"unsupported MTP layer type {lt!r}: only full_attention is handled"
+                    )
+                ratios.append(ratio)
+
+        self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones

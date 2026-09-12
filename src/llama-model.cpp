@@ -2507,6 +2507,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // note: qwen4exp is deliberately NOT here. Its MTP block is a
+                // full-attention layer that also carries its own QSA indexer
+                // (mtp.layers.0.self_attn.indexer.*), and the reference masks the
+                // draft attention to the indexer's selected cells. A plain-nextn KV
+                // cache would give it no indexer at all, so it would silently fall
+                // back to dense attention -- plausible drafts, wrong semantics. It
+                // is handled in the hybrid_idx branch below with flipped filters.
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
@@ -2545,18 +2552,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
-                        };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
-                        };
-
-                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
+                        if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                            // MTP draft context: the same three-cache layout as the
+                            // trunk, filtered to the draft layer instead of away from
+                            // it. The draft block is full attention AND carries a QSA
+                            // indexer, so filter_idx must select it too -- dropping
+                            // the indexer here would make build_layer_attn fall back
+                            // to dense attention and quietly change the model.
+                            // It has no recurrent layer, so filter_recr selects none.
+                            filter_attn = [&](uint32_t il) {
+                                return il >= hparams.n_layer();
+                            };
+                            filter_recr = [&](uint32_t) {
+                                return false;
+                            };
+                            if (hparams.indexer_head_size > 0) {
+                                filter_idx = [&](uint32_t il) {
+                                    return il >= hparams.n_layer();
+                                };
+                            }
+                        } else {
+                            filter_attn = [&](uint32_t il) {
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
+                            filter_recr = [&](uint32_t il) {
+                                return il < hparams.n_layer() && hparams.is_recr(il);
+                            };
+
+                            if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+                                // QSA runs on the dense-attention layers only
+                                filter_idx = [&](uint32_t il) {
+                                    return il < hparams.n_layer() && !hparams.is_recr(il);
+                                };
+                            }
                         }
                     }
 
