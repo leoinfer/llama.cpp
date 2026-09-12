@@ -1308,7 +1308,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
-        cparams_dft.n_rs_seq = 0;
+        // The draft context must be able to roll back a rejected speculative
+        // suffix, and that is exactly what n_rs_seq buys: llama_memory_recurrent::seq_rm
+        // refuses a partial rollback when
+        //   rollback <= n_rs_seq
+        // does not hold, and common_context_seq_rm ABORTS on a false return. Leaving
+        // this at 0 makes every speculative rollback fatal on a hybrid draft context.
+        // Sized to the draft depth the speculation actually asks for.
+        cparams_dft.n_rs_seq = std::max(1, params.speculative.draft.n_max);
 
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
