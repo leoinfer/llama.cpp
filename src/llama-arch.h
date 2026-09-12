@@ -690,6 +690,16 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // qwen4exp MTP: fusion projections/norms and the MTP head's own
+    // hyper-connection mixer. The rest of the MTP layer reuses the main
+    // decoder-layer tensors at the MTP block id.
+    LLM_TENSOR_NEXTN_FC_EMBEDDING,
+    LLM_TENSOR_NEXTN_FC_HIDDEN,
+    LLM_TENSOR_NEXTN_PRE_FC_NORM_EMBEDDING,
+    LLM_TENSOR_NEXTN_PRE_FC_NORM_HIDDEN,
+    LLM_TENSOR_NEXTN_HC_MIXER_NORM,
+    LLM_TENSOR_NEXTN_HC_MIXER_DOWN,
+    LLM_TENSOR_NEXTN_HC_MIXER_UP,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
