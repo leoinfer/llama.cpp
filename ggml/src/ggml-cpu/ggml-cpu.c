@@ -1655,6 +1655,7 @@ static uint64_t        g_resident_hit     = 0;
 static uint64_t        g_resident_miss    = 0;
 static uint64_t        g_resident_evicted = 0;
 static int             g_resident_failed  = 0;
+static int             g_resident_freeze  = -1;
 static pthread_mutex_t g_resident_mutex   = PTHREAD_MUTEX_INITIALIZER;
 
 #ifndef MLOCK_ONFAULT
@@ -1673,6 +1674,24 @@ static size_t ggml_cpu_moe_resident_init(void) {
         }
     }
     return budget;
+}
+
+// freeze-first policy: once the budget is full, stop admitting instead of evicting. Measured
+// 2026-09-15: the LRU variant issues an mlock/munlock pair per routed slab (~480 per token), which
+// serializes on mmap_lock; that arm ran several times slower than the control while moving *less*
+// data (0.12 vs 0.95 GB/s). Default off; set QWEN38_MOE_RESIDENT_FREEZE=1 to pin a fixed set.
+static int ggml_cpu_moe_resident_freeze(void) {
+    if (g_resident_freeze < 0) {
+        const char * env = getenv("QWEN38_MOE_RESIDENT_FREEZE");
+        g_resident_freeze = (env != NULL && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return g_resident_freeze;
+}
+
+static void ggml_cpu_moe_resident_admit_key(const void * ptr, size_t len, int block, int expert);
+
+static void ggml_cpu_moe_resident_admit(const void * ptr, size_t len) {
+    ggml_cpu_moe_resident_admit_key(ptr, len, -1, -1);
 }
 
 // per-slab lock: keep the call small (slab sized); large single calls fail on this host
@@ -1699,7 +1718,68 @@ static void ggml_cpu_moe_resident_release(int i) {
     g_resident_evicted++;
 }
 
-static void ggml_cpu_moe_resident_admit(const void * ptr, size_t len) {
+// Optional explicit residency set (QWEN38_MOE_RESIDENT_SET=<tsv>): a policy input produced by
+// workload_profile.py --emit-resident-set, listing the highest-mass (block, expert) pairs that fit a
+// byte budget. Admission is one-time per key and never evicts (freeze semantics), so the hot path pays
+// one mlock per distinct slab instead of one per routed slab.
+#define GGML_CPU_RESIDENT_SET_MAX 65536
+
+static struct { int block; int expert; } g_resident_set[GGML_CPU_RESIDENT_SET_MAX];
+static int  g_resident_set_n     = 0;
+static int  g_resident_set_state = -1;   // -1 unknown, 0 none, 1 loaded
+static int  g_resident_last_block = -1;
+static const void * g_resident_last_tensor = NULL;
+static int  ggml_cpu_moe_block_of(const struct ggml_tensor * w) {
+    if (w == g_resident_last_tensor) {
+        return g_resident_last_block;
+    }
+    int blk = -1;
+    if (w != NULL && w->name != NULL && strncmp(w->name, "blk.", 4) == 0) {
+        blk = atoi(w->name + 4);
+    }
+    g_resident_last_tensor = w;
+    g_resident_last_block = blk;
+    return blk;
+}
+
+static int ggml_cpu_moe_resident_in_set(int block, int expert) {
+    if (g_resident_set_state < 0) {
+        g_resident_set_state = 0;
+        const char * path = getenv("QWEN38_MOE_RESIDENT_SET");
+        if (path != NULL && path[0] != '\0') {
+            FILE * f = fopen(path, "r");
+            if (f == NULL) {
+                GGML_LOG_WARN("%s: cannot open resident set %s: %s\n", __func__, path, strerror(errno));
+            } else {
+                int b, e;
+                while (g_resident_set_n < GGML_CPU_RESIDENT_SET_MAX && fscanf(f, "%d %d", &b, &e) == 2) {
+                    g_resident_set[g_resident_set_n].block = b;
+                    g_resident_set[g_resident_set_n].expert = e;
+                    g_resident_set_n++;
+                }
+                fclose(f);
+                g_resident_set_state = 1;
+                GGML_LOG_INFO("%s: resident set %s: %d (block, expert) keys\n", __func__, path, g_resident_set_n);
+            }
+        }
+    }
+    if (g_resident_set_state != 1) {
+        return 0;
+    }
+    for (int i = 0; i < g_resident_set_n; ++i) {
+        if (g_resident_set[i].block == block && g_resident_set[i].expert == expert) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void ggml_cpu_moe_resident_admit_key(const void * ptr, size_t len, int block, int expert) {
+    if (block >= 0 && (g_resident_set_state != 0 || getenv("QWEN38_MOE_RESIDENT_SET") != NULL)) {
+        if (!ggml_cpu_moe_resident_in_set(block, expert)) {
+            return;
+        }
+    }
     const size_t budget = ggml_cpu_moe_resident_init();
     if (budget == 0 || len == 0 || len > budget || g_resident_failed) {
         return;
@@ -1716,6 +1796,10 @@ static void ggml_cpu_moe_resident_admit(const void * ptr, size_t len) {
             pthread_mutex_unlock(&g_resident_mutex);
             return;
         }
+    }
+    if (ggml_cpu_moe_resident_freeze() && g_resident_bytes + len > budget) {
+        pthread_mutex_unlock(&g_resident_mutex);
+        return;
     }
     while (g_resident_n >= GGML_CPU_RESIDENT_MAX || g_resident_bytes + len > budget) {
         int victim = 0;
@@ -1886,7 +1970,7 @@ static void ggml_cpu_moe_prefetch_experts(const struct ggml_tensor * w, const st
                 continue;
             }
             const void * p = (const char *) w->data + (int64_t) id * w->nb[2];
-            ggml_cpu_moe_resident_admit(p, w->nb[2]);
+            ggml_cpu_moe_resident_admit_key(p, w->nb[2], ggml_cpu_moe_block_of(w), (int) id);
             if (mode == 2 || mode == 3 || mode == 5 || mode == 6) {
                 ggml_cpu_prefetch_enqueue(p, w->nb[2]);
             }
