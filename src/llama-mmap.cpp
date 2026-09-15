@@ -462,6 +462,18 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 }
 #endif
 
+// BASE lane: POSIX_MADV_RANDOM for model mappings (QWEN38_MMAP_RANDOM=1).
+//
+// MoE expert weights are read at slab offsets that are unrelated between layers,
+// so the kernel's mmap readahead fetches bytes the layer never uses while the
+// demand queue stays shallow. Disabling readahead here, together with
+// MADV_WILLNEED for exactly the routed slabs (ggml-cpu mul_mat_id,
+// GGML_CPU_MOE_PREFETCH=1), trades speculative bytes for needed ones.
+static bool llama_mmap_random_hint() {
+    static const bool enabled = getenv("QWEN38_MMAP_RANDOM") != nullptr;
+    return enabled;
+}
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
@@ -505,7 +517,7 @@ struct llama_mmap::impl {
         for (const auto & range : lazy_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
-        if (numa) {
+        if (numa || llama_mmap_random_hint()) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                         strerror(errno));

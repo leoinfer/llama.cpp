@@ -37,6 +37,7 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sys/mman.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -1547,6 +1548,157 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// Expert-slab page-cache prefetch (BASE lane).
+//
+// The routed expert weights of a MoE model loaded with mmap live in the model
+// file mapping. Without a prefetch the kernel services each fault with a single
+// fault-around window, so the device queue depth stays near 1 and the feed runs
+// well below what the same drive delivers at QD >= 8 (measured on this host:
+// ~2.4 GB/s deployed vs 3.5-3.9 GB/s at QD 8-32 on 2 MiB slabs).
+//
+// MADV_WILLNEED on a 1-2 MiB slab blocks its caller until that slab's reads are
+// submitted and (measured on this host) completes in ~0.9 ms; issuing 30 of them
+// serially from the compute thread costs more than the compute it is meant to
+// overlap with. The engine moves the hinting off the compute path: the MoE hook
+// enqueues the routed slabs, worker threads issue the hints, and the compute
+// threads never wait on the queue (a full queue drops, it never blocks).
+//
+// This is a page-cache hint only: it cannot change a computed value, and it is a
+// no-op for tensors that are not file-backed.
+//
+// Modes (GGML_CPU_MOE_PREFETCH):
+//   1 = issue MADV_WILLNEED inline for this node's routed slabs
+//   2 = enqueue them to the async prefetch engine
+//   3 = both
+//   engine threads: GGML_CPU_MOE_PREFETCH_THREADS (default 4)
+#define GGML_CPU_PREFETCH_QUEUE 8192
+
+static int ggml_cpu_moe_prefetch_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * env = getenv("GGML_CPU_MOE_PREFETCH");
+        mode = env ? atoi(env) : 0;
+    }
+    return mode;
+}
+
+static void ggml_cpu_prefetch_range(const void * ptr, size_t len) {
+#if defined(__gnu_linux__)
+    if (len == 0) {
+        return;
+    }
+    const uintptr_t page = 4096;
+    const uintptr_t addr = (uintptr_t) ptr & ~(page - 1);
+    const size_t    plen = (uintptr_t) ptr - addr + len;
+    madvise((void *) addr, plen, MADV_WILLNEED);
+#else
+    (void) ptr; (void) len;
+#endif
+}
+
+struct ggml_cpu_prefetch_engine {
+    pthread_t       workers[8];
+    int             n_workers;
+    pthread_mutex_t lock;
+    pthread_cond_t  cv;
+    size_t          head;
+    size_t          tail;
+    const void *    ptr[GGML_CPU_PREFETCH_QUEUE];
+    size_t          len[GGML_CPU_PREFETCH_QUEUE];
+    long            enqueued;
+    long            dropped;
+};
+
+static struct ggml_cpu_prefetch_engine * g_prefetch = NULL;
+static pthread_once_t g_prefetch_once = PTHREAD_ONCE_INIT;
+
+static void * ggml_cpu_prefetch_worker(void * arg) {
+    struct ggml_cpu_prefetch_engine * e = (struct ggml_cpu_prefetch_engine *) arg;
+    for (;;) {
+        pthread_mutex_lock(&e->lock);
+        while (e->head == e->tail) {
+            pthread_cond_wait(&e->cv, &e->lock);
+        }
+        const void * p = e->ptr[e->head];
+        const size_t l = e->len[e->head];
+        e->head = (e->head + 1) % GGML_CPU_PREFETCH_QUEUE;
+        pthread_mutex_unlock(&e->lock);
+        ggml_cpu_prefetch_range(p, l);
+    }
+    return NULL;
+}
+
+static void ggml_cpu_prefetch_engine_init(void) {
+    struct ggml_cpu_prefetch_engine * e = (struct ggml_cpu_prefetch_engine *) calloc(1, sizeof(*e));
+    if (e == NULL) {
+        return;
+    }
+    pthread_mutex_init(&e->lock, NULL);
+    pthread_cond_init(&e->cv, NULL);
+    const char * env = getenv("GGML_CPU_MOE_PREFETCH_THREADS");
+    int n = env ? atoi(env) : 4;
+    if (n < 1) { n = 1; }
+    if (n > 8) { n = 8; }
+    for (int i = 0; i < n; ++i) {
+        if (pthread_create(&e->workers[i], NULL, ggml_cpu_prefetch_worker, e) != 0) {
+            break;
+        }
+        e->n_workers++;
+    }
+    g_prefetch = e;
+    GGML_LOG_INFO("%s: expert prefetch engine started with %d worker(s), queue %d\n",
+                  __func__, e->n_workers, GGML_CPU_PREFETCH_QUEUE);
+}
+
+static void ggml_cpu_prefetch_enqueue(const void * ptr, size_t len) {
+    if (len == 0 || ptr == NULL) {
+        return;
+    }
+    pthread_once(&g_prefetch_once, ggml_cpu_prefetch_engine_init);
+    struct ggml_cpu_prefetch_engine * e = g_prefetch;
+    if (e == NULL) {
+        return;
+    }
+    if (pthread_mutex_trylock(&e->lock) != 0) {
+        e->dropped++;
+        return;
+    }
+    const size_t next = (e->tail + 1) % GGML_CPU_PREFETCH_QUEUE;
+    if (next == e->head) {
+        e->dropped++;
+        pthread_mutex_unlock(&e->lock);
+        return;
+    }
+    e->ptr[e->tail] = ptr;
+    e->len[e->tail] = len;
+    e->tail = next;
+    e->enqueued++;
+    pthread_mutex_unlock(&e->lock);
+    pthread_cond_signal(&e->cv);
+}
+
+// one slab per routed expert of `w`; ids are [n_expert_used, n_tokens] i32
+static void ggml_cpu_moe_prefetch_experts(const struct ggml_tensor * w, const struct ggml_tensor * ids, int mode) {
+    if (w == NULL || ids == NULL || w->data == NULL || w->nb[2] == 0) {
+        return;
+    }
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            const int32_t id = *(const int32_t *) ((const char *) ids->data + i1*ids->nb[1] + i0*ids->nb[0]);
+            if (id < 0 || id >= w->ne[2]) {
+                continue;
+            }
+            const void * p = (const char *) w->data + (int64_t) id * w->nb[2];
+            if (mode == 2 || mode == 3) {
+                ggml_cpu_prefetch_enqueue(p, w->nb[2]);
+            }
+            if (mode == 1 || mode == 3) {
+                ggml_cpu_prefetch_range(p, w->nb[2]);
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1659,6 +1811,13 @@ static void ggml_compute_forward_mul_mat_id(
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+
+        // BASE lane: put the routed expert slabs in flight before the first
+        // compute thread touches them (page-cache hint; no effect on values)
+        const int moe_prefetch = ggml_cpu_moe_prefetch_mode();
+        if (moe_prefetch > 0) {
+            ggml_cpu_moe_prefetch_experts(src0, ids, moe_prefetch);
         }
     }
 

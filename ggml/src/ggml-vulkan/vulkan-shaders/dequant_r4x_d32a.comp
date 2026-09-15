@@ -1,0 +1,33 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "dequant_head.glsl"
+
+// Four output values per invocation.  R4X rows are multiples of 256, so the
+// four-value path never crosses a superblock for valid model tensors.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+#include "dequant_funcs.glsl"
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x * 4u;
+    if (i >= p.nel) {
+        return;
+    }
+
+    const uint ib = i / QUANT_K;
+    const uint iqs = i % QUANT_K;
+    const vec4 v = dequantize4(ib, iqs, 0);
+
+    [[unroll]] for (uint l = 0; l < 4u; ++l) {
+        if (i + l < p.nel) {
+            data_b[i + l] = D_TYPE(v[l]);
+        }
+    }
+}
