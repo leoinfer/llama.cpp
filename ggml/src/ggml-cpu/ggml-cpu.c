@@ -38,6 +38,7 @@
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -1572,9 +1573,49 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 //   2 = enqueue them to the async prefetch engine (measured: 2.5x on the
 //       stale-page-cache state, 1.13x on a clean one; see
 //       qwen38/results/base_lane/FEED_VARIANTS_AB.json)
-//   3 = both; any other value = off
+//   3 = both; 5 = engine using readahead(2) fills instead of madvise; 6 = 5 + inline
+//   any other value = off
 //   engine threads: GGML_CPU_MOE_PREFETCH_THREADS (default 4, 8 used in the A/B)
 #define GGML_CPU_PREFETCH_QUEUE 8192
+
+// Mapping registry: a weight mapping's address range -> the file it came from.
+// llama.cpp registers every mmap it makes, so the feed engine can issue
+// readahead(2) for exactly the routed slab: readahead(2) queues the range and
+// returns without waiting, unlike madvise(MADV_WILLNEED), which was measured to
+// block its caller for ~0.9 ms per 1-2 MiB slab on this host.
+#define GGML_CPU_MAP_MAX 32
+
+struct ggml_cpu_mapping {
+    const char * base;
+    size_t       size;
+    int          fd;
+};
+static struct ggml_cpu_mapping g_mappings[GGML_CPU_MAP_MAX];
+static int g_n_mappings = 0;
+
+// exported for llama.cpp (resolved through the backend registry)
+void ggml_cpu_moe_register_mapping(const void * base, size_t size, int fd) {
+    if (base == NULL || size == 0 || fd < 0 || g_n_mappings >= GGML_CPU_MAP_MAX) {
+        return;
+    }
+    g_mappings[g_n_mappings].base = (const char *) base;
+    g_mappings[g_n_mappings].size = size;
+    g_mappings[g_n_mappings].fd   = fd;
+    g_n_mappings++;
+}
+
+static int ggml_cpu_mapping_lookup(const void * ptr, size_t len, int * fd_out, long * off_out) {
+    const char * p = (const char *) ptr;
+    for (int i = 0; i < g_n_mappings; ++i) {
+        const struct ggml_cpu_mapping * m = &g_mappings[i];
+        if (p >= m->base && p + len <= m->base + m->size) {
+            *fd_out  = m->fd;
+            *off_out = (long) (p - m->base);
+            return 1;
+        }
+    }
+    return 0;
+}
 
 static int ggml_cpu_moe_prefetch_mode(void) {
     static int mode = -1;
@@ -1599,7 +1640,27 @@ static void ggml_cpu_prefetch_range(const void * ptr, size_t len) {
 #endif
 }
 
+// preferred fill: readahead(2) when the mapping is known (non-blocking, queues the
+// whole range); madvise(WILLNEED) otherwise (blocks the caller on this host).
+static void ggml_cpu_fill_range(const void * ptr, size_t len) {
+#if defined(__gnu_linux__)
+    int  fd  = -1;
+    long off = 0;
+    if (len == 0) {
+        return;
+    }
+    if (ggml_cpu_mapping_lookup(ptr, len, &fd, &off)) {
+        readahead(fd, off, (size_t) len);
+        return;
+    }
+    ggml_cpu_prefetch_range(ptr, len);
+#else
+    (void) ptr; (void) len;
+#endif
+}
+
 struct ggml_cpu_prefetch_engine {
+    int             use_fill;
     pthread_t       workers[8];
     int             n_workers;
     pthread_mutex_t lock;
@@ -1626,7 +1687,11 @@ static void * ggml_cpu_prefetch_worker(void * arg) {
         const size_t l = e->len[e->head];
         e->head = (e->head + 1) % GGML_CPU_PREFETCH_QUEUE;
         pthread_mutex_unlock(&e->lock);
-        ggml_cpu_prefetch_range(p, l);
+        if (e->use_fill) {
+            ggml_cpu_fill_range(p, l);
+        } else {
+            ggml_cpu_prefetch_range(p, l);
+        }
     }
     return NULL;
 }
@@ -1638,6 +1703,7 @@ static void ggml_cpu_prefetch_engine_init(void) {
     }
     pthread_mutex_init(&e->lock, NULL);
     pthread_cond_init(&e->cv, NULL);
+    e->use_fill = (ggml_cpu_moe_prefetch_mode() >= 5);
     const char * env = getenv("GGML_CPU_MOE_PREFETCH_THREADS");
     int n = env ? atoi(env) : 4;
     if (n < 1) { n = 1; }
@@ -1649,8 +1715,8 @@ static void ggml_cpu_prefetch_engine_init(void) {
         e->n_workers++;
     }
     g_prefetch = e;
-    GGML_LOG_INFO("%s: expert prefetch engine started with %d worker(s), queue %d\n",
-                  __func__, e->n_workers, GGML_CPU_PREFETCH_QUEUE);
+    GGML_LOG_INFO("%s: expert prefetch engine started with %d worker(s), queue %d, fill=%s\n",
+                  __func__, e->n_workers, GGML_CPU_PREFETCH_QUEUE, e->use_fill ? "readahead" : "madvise");
 }
 
 static void ggml_cpu_prefetch_enqueue(const void * ptr, size_t len) {
@@ -1692,10 +1758,10 @@ static void ggml_cpu_moe_prefetch_experts(const struct ggml_tensor * w, const st
                 continue;
             }
             const void * p = (const char *) w->data + (int64_t) id * w->nb[2];
-            if (mode == 2 || mode == 3) {
+            if (mode == 2 || mode == 3 || mode == 5 || mode == 6) {
                 ggml_cpu_prefetch_enqueue(p, w->nb[2]);
             }
-            if (mode == 1 || mode == 3) {
+            if (mode == 1 || mode == 3 || mode == 6) {
                 ggml_cpu_prefetch_range(p, w->nb[2]);
             }
         }

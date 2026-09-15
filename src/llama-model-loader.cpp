@@ -1436,6 +1436,20 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmap->init(mapping->addr());
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
+
+            // tell the CPU backend which file each mapping belongs to, so an
+            // expert-feed engine can issue fills with readahead(2) (non-blocking,
+            // queues a whole slab) instead of madvise(MADV_WILLNEED) (which blocks
+            // its caller on 1-2 MiB ranges). Optional: the backend may not export it.
+            if (dev) {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto * register_fn = (void (*)(const void *, size_t, int))
+                        ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_register_mapping");
+                if (register_fn) {
+                    register_fn(mapping->addr(), mapping->size(), file->file_id());
+                }
+            }
+
             mappings.emplace_back(std::move(mapping));
         }
     }
