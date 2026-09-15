@@ -1567,10 +1567,13 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 // no-op for tensors that are not file-backed.
 //
 // Modes (GGML_CPU_MOE_PREFETCH):
-//   1 = issue MADV_WILLNEED inline for this node's routed slabs
-//   2 = enqueue them to the async prefetch engine
-//   3 = both
-//   engine threads: GGML_CPU_MOE_PREFETCH_THREADS (default 4)
+//   1 = issue MADV_WILLNEED inline for this node's routed slabs (blocks the
+//       compute thread: measured neutral-to-negative, kept for A/B)
+//   2 = enqueue them to the async prefetch engine (measured: 2.5x on the
+//       stale-page-cache state, 1.13x on a clean one; see
+//       qwen38/results/base_lane/FEED_VARIANTS_AB.json)
+//   3 = both; any other value = off
+//   engine threads: GGML_CPU_MOE_PREFETCH_THREADS (default 4, 8 used in the A/B)
 #define GGML_CPU_PREFETCH_QUEUE 8192
 
 static int ggml_cpu_moe_prefetch_mode(void) {
