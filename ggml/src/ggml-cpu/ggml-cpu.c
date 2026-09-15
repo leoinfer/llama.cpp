@@ -1617,6 +1617,134 @@ static int ggml_cpu_mapping_lookup(const void * ptr, size_t len, int * fd_out, l
     return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// Optional bounded residency (BASE lane): keep the most recently routed slabs unevictable.
+//
+// Why: measured 2026-09-15 in the multi-prompt churn regime, the page cache retained nothing -
+// cg_workingset_activate_file delta was 0 while refaults ran into the hundreds of thousands, so
+// every pass re-read ~0.7 GB/token. This marks the pages of the most recently routed slabs as
+// locked, so the kernel cannot reclaim them between passes.
+//
+//   QWEN38_MOE_RESIDENT_MB = 0 (default, off) | slab bytes to keep resident
+//
+// Mechanism: mlock() of the slab's page-aligned range *inside the model mapping itself*, so the
+// pages the compute path reads are the pages that get locked (no second mapping, no extra faults).
+// Measurements on this host (CachyOS 7.3.0-rc2, RLIMIT_MEMLOCK unlimited), 2026-09-15:
+//   * one 8 MiB call: ok; chunked 8 MiB x 32 (256 MiB total): ok, Mlocked grows by 255.9 MiB;
+//   * a single 2.8 MiB call (slab sized): ok - this is the size the engine uses;
+//   * single calls of 64 MiB and above on this file: ENOMEM (do not batch slabs into one mlock);
+//   * mlock2(MLOCK_ONFAULT) returns 0 but does NOT lock the pages on this kernel.
+//
+// Memory policy only: it cannot change a computed value, and it can only make pages harder to evict.
+#define GGML_CPU_RESIDENT_MAX 16384
+
+struct ggml_cpu_resident_entry {
+    char *   addr;   // page-aligned start of the locked range
+    size_t   len;    // locked length
+    size_t   slab;   // slab bytes accounted against the budget
+    uint64_t last;   // LRU stamp
+};
+
+static struct ggml_cpu_resident_entry g_resident[GGML_CPU_RESIDENT_MAX];
+static int             g_resident_n       = 0;
+static size_t          g_resident_bytes   = 0;
+static size_t          g_resident_budget  = 0;   // bytes; 0 = disabled
+static uint64_t        g_resident_clock   = 0;
+static uint64_t        g_resident_hit     = 0;
+static uint64_t        g_resident_miss    = 0;
+static uint64_t        g_resident_evicted = 0;
+static int             g_resident_failed  = 0;
+static pthread_mutex_t g_resident_mutex   = PTHREAD_MUTEX_INITIALIZER;
+
+#ifndef MLOCK_ONFAULT
+#define MLOCK_ONFAULT 1
+#endif
+
+static size_t ggml_cpu_moe_resident_init(void) {
+    static size_t budget = (size_t) -1;
+    if (budget == (size_t) -1) {
+        const char * env = getenv("QWEN38_MOE_RESIDENT_MB");
+        const long mb = env ? atol(env) : 0;
+        budget = (mb > 0) ? (size_t) mb * 1024 * 1024 : 0;
+        if (budget > 0) {
+            GGML_LOG_INFO("%s: expert residency budget %ld MB (max %d slabs)\n",
+                    __func__, (long) mb, GGML_CPU_RESIDENT_MAX);
+        }
+    }
+    return budget;
+}
+
+// per-slab lock: keep the call small (slab sized); large single calls fail on this host
+static int ggml_cpu_mlock_slab(void * addr, size_t len) {
+#if defined(__gnu_linux__)
+    return mlock(addr, len);
+#else
+    (void) addr; (void) len;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+// caller holds the mutex
+static void ggml_cpu_moe_resident_release(int i) {
+    struct ggml_cpu_resident_entry * e = &g_resident[i];
+    if (e->addr != NULL && munlock(e->addr, e->len) != 0) {
+        // not fatal: the pages simply stay locked, which is the conservative direction
+        GGML_LOG_WARN("%s: munlock failed: %s\n", __func__, strerror(errno));
+    }
+    g_resident_bytes -= e->slab;
+    g_resident[i] = g_resident[g_resident_n - 1];
+    g_resident_n--;
+    g_resident_evicted++;
+}
+
+static void ggml_cpu_moe_resident_admit(const void * ptr, size_t len) {
+    const size_t budget = ggml_cpu_moe_resident_init();
+    if (budget == 0 || len == 0 || len > budget || g_resident_failed) {
+        return;
+    }
+    const size_t page = 4096;
+    char * addr = (char *) ((uintptr_t) ptr & ~(page - 1));
+    const size_t alen = ((uintptr_t) ptr - (uintptr_t) addr + len + page - 1) & ~(page - 1);
+
+    pthread_mutex_lock(&g_resident_mutex);
+    for (int i = 0; i < g_resident_n; ++i) {
+        if (g_resident[i].addr == addr && g_resident[i].len == alen) {
+            g_resident[i].last = ++g_resident_clock;
+            g_resident_hit++;
+            pthread_mutex_unlock(&g_resident_mutex);
+            return;
+        }
+    }
+    while (g_resident_n >= GGML_CPU_RESIDENT_MAX || g_resident_bytes + len > budget) {
+        int victim = 0;
+        for (int i = 1; i < g_resident_n; ++i) {
+            if (g_resident[i].last < g_resident[victim].last) {
+                victim = i;
+            }
+        }
+        ggml_cpu_moe_resident_release(victim);
+    }
+    if (ggml_cpu_mlock_slab(addr, alen) != 0) {
+        g_resident_failed = 1;
+        GGML_LOG_WARN("%s: mlock of %zu bytes failed: %s (residency disabled)\n", __func__, alen, strerror(errno));
+        pthread_mutex_unlock(&g_resident_mutex);
+        return;
+    }
+    struct ggml_cpu_resident_entry * e = &g_resident[g_resident_n++];
+    e->addr = addr; e->len = alen; e->slab = len; e->last = ++g_resident_clock;
+    g_resident_bytes += len;
+    g_resident_miss++;
+    if ((g_resident_miss + g_resident_hit) % 4096 == 0) {
+        GGML_LOG_INFO("%s: resident %.0f MB over %d slabs, hits %llu misses %llu evictions %llu\n",
+                __func__, (double) g_resident_bytes / (1024.0 * 1024.0), g_resident_n,
+                (unsigned long long) g_resident_hit, (unsigned long long) g_resident_miss,
+                (unsigned long long) g_resident_evicted);
+    }
+    pthread_mutex_unlock(&g_resident_mutex);
+}
+
 static int ggml_cpu_moe_prefetch_mode(void) {
     static int mode = -1;
     if (mode < 0) {
@@ -1758,6 +1886,7 @@ static void ggml_cpu_moe_prefetch_experts(const struct ggml_tensor * w, const st
                 continue;
             }
             const void * p = (const char *) w->data + (int64_t) id * w->nb[2];
+            ggml_cpu_moe_resident_admit(p, w->nb[2]);
             if (mode == 2 || mode == 3 || mode == 5 || mode == 6) {
                 ggml_cpu_prefetch_enqueue(p, w->nb[2]);
             }

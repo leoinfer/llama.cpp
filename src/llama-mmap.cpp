@@ -474,6 +474,42 @@ static bool llama_mmap_random_hint() {
     return enabled;
 }
 
+// BASE lane: retention knobs. The lazy ranges are the expert tensors: they are re-read across
+// tokens, so the advice they carry decides whether the page cache can keep them at all.
+// Measured 2026-09-15 in the multi-prompt churn regime: cg_workingset_activate_file delta was 0
+// while refaults ran into the hundreds of thousands - every pass paid the I/O again.
+// Defaults preserve the behaviour that was measured before these knobs existed.
+//   QWEN38_MAP_EXPERT_ADVICE = random (default) | normal
+//       willneed/sequential are deliberately NOT offered: the lazy ranges are whole expert tensors,
+//       so WILLNEED would read the entire expert bank at load time and SEQUENTIAL carries drop-behind
+//       semantics - the opposite of retention. Normal is the retention-friendly choice.
+//   QWEN38_FADV_SEQUENTIAL   = 1 (default) | 0   - file-wide posix_fadvise(POSIX_FADV_SEQUENTIAL),
+//                                                  which carries drop-behind semantics for the
+//                                                  whole artifact, expert ranges included
+static int llama_mmap_expert_advice() {
+    static const int advice = []() -> int {
+        const char * env = getenv("QWEN38_MAP_EXPERT_ADVICE");
+        if (env == nullptr || strcmp(env, "random") == 0) {
+            return POSIX_MADV_RANDOM;
+        }
+        if (strcmp(env, "normal") == 0) { return POSIX_MADV_NORMAL; }
+        return POSIX_MADV_RANDOM;
+    }();
+    return advice;
+}
+
+static bool llama_fadv_sequential() {
+    static const bool enabled = []() {
+        const char * env = getenv("QWEN38_FADV_SEQUENTIAL");
+        return env == nullptr || strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static const char * llama_expert_advice_name() {
+    return llama_mmap_expert_advice() == POSIX_MADV_NORMAL ? "POSIX_MADV_NORMAL" : "POSIX_MADV_RANDOM";
+}
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
@@ -484,7 +520,7 @@ struct llama_mmap::impl {
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+        if (llama_fadv_sequential() && posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
@@ -514,14 +550,23 @@ struct llama_mmap::impl {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
-        for (const auto & range : lazy_ranges) {
-            advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
-        }
+        // whole-file advice FIRST: the per-range advice below must be able to override it for the
+        // expert ranges (madvise is per-VMA and the last advice on a range wins)
         if (numa || llama_mmap_random_hint()) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                         strerror(errno));
             }
+        }
+        const int expert_advice = llama_mmap_expert_advice();
+        for (const auto & range : lazy_ranges) {
+            advise(range.first, range.second, expert_advice, llama_expert_advice_name());
+        }
+        if (!lazy_ranges.empty()) {
+            LLAMA_LOG_INFO("%s: expert ranges = %zu, advice = %s, whole-file RANDOM = %s, FADV_SEQUENTIAL = %s\n",
+                    __func__, lazy_ranges.size(), llama_expert_advice_name(),
+                    (numa || llama_mmap_random_hint()) ? "on" : "off",
+                    llama_fadv_sequential() ? "on" : "off");
         }
 
         mapped_fragments.emplace_back(0, file->size());
