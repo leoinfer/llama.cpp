@@ -2541,6 +2541,19 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
+#ifdef ALICE_MOE_PROBE_HOOK
+    // Route-mass collection for the alice_ai Q3.9-MIX knapsack: after every
+    // compute, sweep the graph for probe selection nodes and fold them into the
+    // accumulator. Compiled in ONLY via -DALICE_MOE_PROBE_HOOK so no other arch
+    // pays. alice_moe_probe_collect is a no-op unless ALICE_MOE_STATS is set.
+    if (status == GGML_STATUS_SUCCESS && model.arch == LLM_ARCH_ALICE_AI &&
+        std::getenv("ALICE_MOE_STATS")) {
+        ggml_backend_sched_synchronize(sched.get());
+        bool alice_moe_probe_collect(struct ggml_cgraph * gf, int64_t * out_ids);
+        alice_moe_probe_collect(gf, nullptr);
+    }
+#endif
+
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;

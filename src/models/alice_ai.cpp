@@ -1,8 +1,132 @@
 #include "models.h"
 
+#include "ggml-backend.h"
+#include "ggml.h"
+
 #include <cstdlib>
 #include <cstdio>
+#include <string>
+#include <vector>
 #include "llama-memory-recurrent.h"
+
+
+// ---------------------------------------------------------------------------
+// ALICE_MOE_STATS: route-mass accumulator (see models.h).
+//
+// Called by the context after every graph compute when the alice probe nodes
+// exist; reads back ffn_moe_topk-<il> via the scheduler's host sync and adds
+// each selected id to its layer histogram. Written once at process exit.
+static thread_local alice_moe_probe g_alice_probe;
+
+void alice_moe_probe::arm(int nlay, int nexp, int ntop) {
+    if (active) {
+        return;
+    }
+    active = true;
+    n_layer = nlay;
+    n_expert = nexp;
+    topk = ntop;
+    counts.assign((size_t) nlay, std::vector<int64_t>((size_t) nexp, 0));
+}
+
+void alice_moe_probe::observe(const char * name, const int32_t * ids, int64_t n_ids) {
+    if (!active || !ids || n_ids <= 0) {
+        return;
+    }
+    // name is "ffn_moe_topk-<il>"
+    const char * dash = strrchr(name, '-');
+    if (!dash) {
+        return;
+    }
+    int il = atoi(dash + 1);
+    if (il < 0 || il >= n_layer) {
+        return;
+    }
+    for (int64_t i = 0; i < n_ids; ++i) {
+        int e = (int) ids[i];
+        if (e >= 0 && e < n_expert) {
+            counts[(size_t) il][(size_t) e] += 1;
+        }
+    }
+}
+
+std::string alice_moe_probe::json() const {
+    std::string out = "{";
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"n_layer\":%d,\"n_expert\":%d,\"topk\":%d,\"tokens\":%lld,\"counts\":[",
+        n_layer, n_expert, topk, (long long) tokens);
+    out += buf;
+    for (int l = 0; l < n_layer; ++l) {
+        out += (l ? ",[" : "[");
+        for (int e = 0; e < n_expert; ++e) {
+            char nb[32];
+            snprintf(nb, sizeof(nb), "%s%lld", e ? "," : "", (long long) counts[(size_t) l][(size_t) e]);
+            out += nb;
+        }
+        out += "]";
+    }
+    return out + "]}";
+}
+
+
+// Read the probe selection tensors out of a *computed* graph. ggml keeps every
+// node buffer in its scheduler allocations; after a synchronous compute the
+// buffers already hold results, so a plain host copy is exact.
+
+bool alice_moe_probe_collect(ggml_cgraph * gf, int64_t * out_ids) {
+    if (!g_alice_probe.active || !gf) {
+        return false;
+    }
+    const char * want = "ffn_moe_topk-";
+    const size_t want_len = strlen(want);
+    int64_t total = 0;
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (!t || !t->name[0]) {
+            continue;
+        }
+        if (strncmp(t->name, want, want_len) != 0) {
+            continue;
+        }
+        const int64_t n = ggml_nelements(t);
+        if (n <= 0) {
+            continue;
+        }
+        std::vector<int32_t> ids((size_t) n);
+        ggml_backend_tensor_get(t, ids.data(), 0, (size_t) n * sizeof(int32_t));
+        g_alice_probe.observe(t->name, ids.data(), n);
+        total += n;
+    }
+    g_alice_probe.tokens += 1;
+    if (out_ids) {
+        *out_ids = total;
+    }
+    return true;
+}
+
+
+void alice_moe_probe_write(const alice_moe_probe & probe) {
+    const char * path = std::getenv("ALICE_MOE_STATS");
+    if (!path || !*path) {
+        return;
+    }
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "[alice] ALICE_MOE_STATS: cannot open %s\n", path);
+        return;
+    }
+    std::string j = probe.json();
+    fwrite(j.data(), 1, j.size(), f);
+    fclose(f);
+    int64_t tot = 0;
+    for (const auto & row : probe.counts) {
+        for (auto c : row) {
+            tot += c;
+        }
+    }
+    fprintf(stderr, "[alice] wrote route mass to %s (%lld selections)\n", path, (long long) tot);
+}
 
 // Yandex AliceAI-80B-A3B: hybrid 3xKDA+1xgated-attention, sigmoid-router MoE with
 // bias correction + shared expert, split block-attention-residual (depth-softmax-mix).
@@ -214,12 +338,22 @@ static ggml_tensor * depth_softmax_mix(ggml_context * ctx0, std::vector<ggml_ten
 
 
 
+llama_model_alice_ai::graph::~graph() {
+    if (g_alice_probe.active) {
+        alice_moe_probe_write(g_alice_probe);
+    }
+}
+
 llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
 
     const auto & hparams = model.hparams;
     const int64_t n_layer = hparams.n_layer();
     const int64_t n_head  = hparams.n_head();
+
+    if (std::getenv("ALICE_MOE_STATS")) {
+        g_alice_probe.arm((int) n_layer, (int) hparams.n_expert, (int) hparams.n_expert_used());
+    }
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -395,6 +529,19 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         // ---- MoE: sigmoid router + bias correction + renorm + shared expert
+        // ALICE_PROBE: route-mass instrumentation. Recompute the identical router
+        // logits here (a second matmul, only ~fine when the env var is set) so the
+        // top-k selection is materialised as a readable tensor. build_moe_ffn below
+        // recomputes from the same inputs, so the selected experts are bit-identical.
+        // The probe hook API collects all named graph tensors after compute; the
+        // runtime accumulates per-(layer, expert) selection mass from ffn_moe_topk.
+        if (std::getenv("ALICE_PROBE_TOPK")) {
+            ggml_tensor * probe_logits = build_lora_mm(layer.ffn_gate_inp, ffn_inp);
+            probe_logits = ggml_sigmoid(ctx0, probe_logits);
+            probe_logits = ggml_add(ctx0, probe_logits, layer.ffn_exp_probs_b);
+            ggml_tensor * probe_topk = ggml_argsort_top_k(ctx0, probe_logits, hparams.n_expert_used());
+            cb(probe_topk, "ffn_moe_topk", il);
+        }
         ggml_tensor * moe_out = build_moe_ffn(ffn_inp,
             layer.ffn_gate_inp,
             layer.ffn_up_exps,

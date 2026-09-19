@@ -2596,6 +2596,32 @@ struct llama_model_kimi_k3 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// Route-mass instrumentation for the Q3.9-MIX knapsack. When ALICE_MOE_STATS is
+// set, the alice_ai graph snapshots every ffn_moe_topk tensor (built only in
+// probe mode) after each compute and accumulates per-(layer, expert) selection
+// mass. The context drains it on model teardown and writes JSON:
+//   {n_layer, n_expert, topk, runs, tokens, counts[[...]...]}
+// Because ggml graphs are rebuilt per decode, the accumulator keeps a copy of
+// the shape on first sight; tensors are read after ggml_backend_sched sync.
+struct alice_moe_probe {
+    bool active = false;
+    int n_layer = 0;
+    int n_expert = 0;
+    int topk = 0;
+    int64_t tokens = 0; // ubatches observed (== forward calls)
+    std::vector<std::vector<int64_t>> counts; // [layer][expert]
+
+    void arm(int nlay, int nexp, int ntop);
+    void observe(const char * name, const int32_t * ids, int64_t n_ids);
+    std::string json() const;
+};
+void alice_moe_probe_write(const alice_moe_probe & probe);
+// Walk the computed graph for probe nodes ffn_moe_topk-<il> (present only when
+// ALICE_PROBE_TOPK is set at graph build), synchronize each to host, and fold
+// the selected ids into the probe. out_ids is the number of ids total so the
+// caller can derive tokens; returns false when the probe is not armed.
+bool alice_moe_probe_collect(ggml_cgraph * gf, int64_t * out_ids);
+
 struct llama_model_alice_ai : public llama_model_base {
     llama_model_alice_ai(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2603,6 +2629,7 @@ struct llama_model_alice_ai : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
+        ~graph();
         const llama_model & model;
     };
 
