@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
@@ -30,6 +31,7 @@ int main(int argc, char ** argv) {
     cparams.n_ctx     = 512;
     cparams.n_batch   = 512;
     cparams.n_seq_max = 1;
+    cparams.embeddings = getenv("ALICE_EMBD") != nullptr;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) { fprintf(stderr, "ctx failed\n"); return 1; }
 
@@ -51,6 +53,16 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < n_vocab; ++i) idx[i] = i;
     std::partial_sort(idx.begin(), idx.begin() + 10, idx.end(),
         [&](int a, int b) { return logits[a] > logits[b]; });
+
+    if (const float * emb = llama_get_embeddings_ith(ctx, -1)) {
+        const int64_t ne = llama_model_n_embd(model);
+        printf("embd[0..7]:");
+        for (int i = 0; i < 8 && i < ne; ++i) printf(" %.6f", emb[i]);
+        printf("\n");
+        double ss = 0; int nn = 0;
+        for (int64_t i = 0; i < ne; ++i) { ss += (double) emb[i] * emb[i]; nn++; }
+        printf("embd norm: %.6f  (n=%d)\n", sqrt(ss), nn);
+    }
 
     printf("vocab: %d\n", n_vocab);
     printf("top-10:\n");

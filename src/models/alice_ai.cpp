@@ -1,4 +1,7 @@
 #include "models.h"
+
+#include <cstdlib>
+#include <cstdio>
 #include "llama-memory-recurrent.h"
 
 // Yandex AliceAI-80B-A3B: hybrid 3xKDA+1xgated-attention, sigmoid-router MoE with
@@ -9,11 +12,13 @@
 void llama_model_alice_ai::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    // layer topology: every 4th layer (1-indexed) is full attention
-    uint32_t full_attn_interval = 4;
-    ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, /*required=*/false);
-    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
-        hparams.is_recr_impl[i] = ((i + 1) % full_attn_interval != 0);
+    // layer topology: prefer the explicit recurrent_layers array, fall back to the interval
+    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
+        uint32_t full_attn_interval = 4;
+        ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+        for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+            hparams.is_recr_impl[i] = ((i + 1) % full_attn_interval != 0);
+        }
     }
 
     // KDA geometry: per-element decay, key_dim = 32*128 = 4096, value_dim = 4096
@@ -229,13 +234,23 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
     auto * inp_rs   = inp->get_recr();
     auto * inp_attn = inp->get_attn();
 
+    // select the rows that actually need logits (out_ids); required so that the
+    // logits tensor has exactly n_outputs rows
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     // block residual state: completed block outputs; `partial` accumulates in-flight attention
     std::vector<ggml_tensor *> completed;
     completed.reserve(n_layer / 4 + 2);
     completed.push_back(inpL);
     ggml_tensor * partial = nullptr;
+    ggml_tensor * l0_out  = nullptr;
 
     struct ggml_cgraph * gf = this->gf;
+
+    if (std::getenv("ALICE_TRACE_UB")) {
+        fprintf(stderr, "[alice] graph build: n_tokens=%d n_seq_tokens=%d n_seqs=%d n_rs_seq=%d\n",
+                ubatch.n_tokens, ubatch.n_seq_tokens, ubatch.n_seqs, cparams.n_rs_seq);
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -409,6 +424,9 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
         cb(cur, "ffn_out", il);
 
         partial = ggml_add(ctx0, partial, cur);
+        if (il == 0) {
+            l0_out = partial;   // captured for the differential harness
+        }
 
         if ((il + 1) % 4 == 0) {
             // block closes: completed grows, partial resets
@@ -425,8 +443,14 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * hidden = depth_softmax_mix(ctx0, completed, model.output_res_proj, model.output_res_norm,
         hparams.f_norm_rms_eps, -1);
     cur = build_norm(hidden, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+    if (std::getenv("ALICE_DUMP_L0") && l0_out) {
+        res->t_embd = l0_out;
+    }
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;

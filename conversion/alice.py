@@ -29,9 +29,13 @@ class AliceAIModel(TextModel):
         self.gguf_writer.add_feed_forward_length(self.hparams.get(
             "intermediate_size", self.hparams["hidden_size"] * 2))
 
-        # hybrid layer marking: every 4th layer (1-indexed) is full attention
+        # hybrid layer marking: honor config layer_types (fall back to the 1-in-4 pattern)
         block = self.hparams["num_hidden_layers"]
-        recurrent = [(i + 1) % 4 != 0 for i in range(block)]
+        ltypes = self.hparams.get("layer_types")
+        if ltypes is not None and len(ltypes) == block:
+            recurrent = [t == "linear_attention" for t in ltypes]
+        else:
+            recurrent = [(i + 1) % 4 != 0 for i in range(block)]
         self.gguf_writer.add_recurrent_layers(recurrent)
         self.gguf_writer.add_full_attention_interval(4)
 
