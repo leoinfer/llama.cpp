@@ -92,6 +92,14 @@ class AliceAIModel(TextModel):
 
         # fused expert tensor -> keep fused (loader creates split + fused handles)
         if name.endswith("mlp.experts.gate_up_proj"):
+            import os
+            if os.environ.get("ALICE_SPLIT_EXPERTS") == "1":
+                # HF layout is [E, 2I, H] with gate in the first half (chunk(2, dim=-1))
+                n_ff = data_torch.shape[1] // 2
+                base = name.removesuffix(".gate_up_proj")
+                yield (self.tensor_name(base + ".gate_proj.weight", bid), data_torch[:, :n_ff].contiguous())
+                yield (self.tensor_name(base + ".up_proj.weight",   bid), data_torch[:, n_ff:].contiguous())
+                return
             yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_UP_EXP, bid), data_torch)
             return
 
