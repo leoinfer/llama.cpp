@@ -161,46 +161,38 @@ static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_t
 }
 
 // depth-softmax-mix over completed blocks (+ in-flight partial):
-//   keys = rms_norm(stack(sources)); scores = keys @ proj_w;
-//   weights = softmax(scores, dim=0); out = sum(sources * weights)
-// Official: stacked = torch.stack(sources, dim=0)          [S, B, T, H]
-//           keys = rmsnorm(stacked); scores = keys @ proj_w  [S, B, T, 1]
-//           weights = softmax(scores, dim=0); out = sum(stacked * weights)
+//   per source: keys_k = rms_norm(src_k) * norm_w ; score_k = proj_w . keys_k   -> scalar per token
+//   weights = softmax([score_0 .. score_{S-1}], dim=0)                          -> [S, T]
+//   out = sum_k src_k * weights_k
+// Official does this on a stacked [S,B,T,H] tensor; ggml softmax runs over dim 0,
+// so scores are assembled with S in dim 0 to make the axis match exactly.
 static ggml_tensor * depth_softmax_mix(ggml_context * ctx0, std::vector<ggml_tensor *> & sources,
         ggml_tensor * proj_w, ggml_tensor * norm_w, float eps, int il) {
     GGML_ASSERT(!sources.empty());
     const int64_t H = sources[0]->ne[0];
     const int64_t T = sources[0]->ne[1];
     const int64_t S = (int64_t) sources.size();
-    // stack sources along dim 2: [H, T, S]
-    ggml_tensor * stacked = sources[0];
-    stacked = ggml_reshape_3d(ctx0, stacked, H, T, 1);
-    for (size_t k = 1; k < sources.size(); ++k) {
-        ggml_tensor * v = ggml_reshape_3d(ctx0, sources[k], H, T, S > 1 ? 1 : 1);
-        stacked = ggml_concat(ctx0, stacked, v, 2);
+
+    ggml_tensor * scores = nullptr;   // [S, T]
+    for (int64_t k = 0; k < S; ++k) {
+        ggml_tensor * x = sources[k];
+        ggml_tensor * normed = ggml_rms_norm(ctx0, x, eps);
+        normed = ggml_mul(ctx0, normed, norm_w);
+        ggml_tensor * sc = ggml_mul_mat(ctx0, proj_w, normed);   // [1, T]
+        scores = (scores == nullptr) ? sc : ggml_concat(ctx0, scores, sc, 0);
     }
-    // rms norm over H (dim 0)
-    ggml_tensor * keys = ggml_rms_norm(ctx0, stacked, eps);
-    keys = ggml_mul(ctx0, keys, norm_w);
-    // scores = keys @ proj_w : [H,T,S] x [H,1] -> [1,T,S]
-    ggml_tensor * keys2d = ggml_reshape_2d(ctx0, keys, H, T * S);
-    ggml_tensor * scores = ggml_mul_mat(ctx0, proj_w, keys2d);   // [1, T*S]
-    scores = ggml_reshape_3d(ctx0, scores, 1, T, S);
-    ggml_tensor * weights = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f, 0.0f);
-    // out = sum_s stacked * weights
-    ggml_tensor * out = ggml_mul(ctx0, stacked, weights);
-    // sum over dim 2 by reshaping to 2d and sum_rows in S-sized blocks is not
-    // directly expressible; accumulate explicitly (S <= 14, weights are scalars)
+    ggml_tensor * weights = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f, 0.0f);  // [S, T]
+
     ggml_tensor * acc = nullptr;
     for (int64_t k = 0; k < S; ++k) {
-        ggml_tensor * sk = ggml_view_3d(ctx0, stacked, H, T, 1, stacked->nb[1], stacked->nb[2], k * stacked->nb[2]);
-        ggml_tensor * wk = ggml_view_3d(ctx0, weights, 1, T, 1, weights->nb[1], weights->nb[2], k * weights->nb[2]);
-        ggml_tensor * term = ggml_mul(ctx0, sk, wk);
+        ggml_tensor * wk = ggml_view_2d(ctx0, weights, 1, T, weights->nb[1], k * ggml_element_size(weights));
+        ggml_tensor * term = ggml_mul(ctx0, sources[k], wk);
         acc = (acc == nullptr) ? term : ggml_add(ctx0, acc, term);
     }
     (void) il;
-    return ggml_reshape_2d(ctx0, acc, H, T);
+    return acc;
 }
+
 
 llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
