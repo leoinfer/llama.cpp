@@ -33,6 +33,12 @@ void alice_moe_probe::arm(int nlay, int nexp, int ntop) {
     topk = ntop;
     counts.assign((size_t) nlay, std::vector<int64_t>((size_t) nexp, 0));
     act2.assign((size_t) nlay, 0.0);
+    if (const char * cap = std::getenv("ALICE_MOE_TRACE_POS")) {
+        trace_cap = atoll(cap);
+        if (trace_cap > 0) {
+            trace.assign((size_t) nlay * (size_t) trace_cap * (size_t) ntop, -1);
+        }
+    }
 }
 
 void alice_moe_probe::observe_act(const char * name, double sum_sq) {
@@ -57,6 +63,9 @@ void alice_moe_probe::observe(const char * name, const int32_t * ids, int64_t n_
         return;
     }
     // name is "ffn_moe_topk-<il>"
+    if (topk > 0) {
+        last_ubatch_tokens = n_ids / topk;   // ids are [k, n_pos]
+    }
     const char * dash = strrchr(name, '-');
     if (!dash) {
         return;
@@ -69,6 +78,20 @@ void alice_moe_probe::observe(const char * name, const int32_t * ids, int64_t n_
         int e = (int) ids[i];
         if (e >= 0 && e < n_expert) {
             counts[(size_t) il][(size_t) e] += 1;
+        }
+    }
+    // teacher-forced route trace: ids are [k, n_pos] flattened position-major
+    if (trace_cap > 0 && topk > 0) {
+        const int64_t n_pos = n_ids / topk;
+        for (int64_t p = 0; p < n_pos; ++p) {
+            const int64_t pos = trace_pos + p;
+            if (pos >= trace_cap) {
+                break;
+            }
+            int32_t * dst = &trace[((size_t) il * (size_t) trace_cap + (size_t) pos) * (size_t) topk];
+            for (int64_t k = 0; k < topk; ++k) {
+                dst[k] = ids[p * topk + k];
+            }
         }
     }
 }
@@ -148,6 +171,11 @@ bool alice_moe_probe_collect(ggml_cgraph * gf, int64_t * out_ids) {
         total += n;
     }
     g_alice_probe.tokens += 1;
+    if (g_alice_probe.trace_cap > 0 && g_alice_probe.topk > 0 && total > 0) {
+        // total counts one layer's ids; the token count of the ubatch is derived
+        // from the first layer only, so compute it from the node count directly.
+        g_alice_probe.trace_pos += g_alice_probe.last_ubatch_tokens;
+    }
     if (out_ids) {
         *out_ids = total;
     }
@@ -168,6 +196,20 @@ void alice_moe_probe_write(const alice_moe_probe & probe) {
     std::string j = probe.json();
     fwrite(j.data(), 1, j.size(), f);
     fclose(f);
+
+    // ALICE_MOE_TRACE: binary per-position route trace (header + int32 payload)
+    if (const char * tp = std::getenv("ALICE_MOE_TRACE")) {
+        FILE * tf = fopen(tp, "wb");
+        if (tf) {
+            const int32_t hdr[4] = { (int32_t) probe.n_layer, (int32_t) probe.trace_cap,
+                                     (int32_t) probe.topk, (int32_t) std::min(probe.trace_pos, probe.trace_cap) };
+            fwrite(hdr, sizeof(hdr), 1, tf);
+            fwrite(probe.trace.data(), sizeof(int32_t), probe.trace.size(), tf);
+            fclose(tf);
+            fprintf(stderr, "[alice] wrote route trace to %s (%lld positions)\n", tp,
+                    (long long) hdr[3]);
+        }
+    }
     int64_t tot = 0;
     for (const auto & row : probe.counts) {
         for (auto c : row) {
@@ -305,9 +347,46 @@ void llama_model_alice_ai::load_arch_tensors(llama_model_loader &) {
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {(int64_t)n_embd}, 0);
     }
+
+    // ---- MTP / nextn draft block (one block past the trunk, plain gated attention + MoE)
+    for (int i = n_layer; i < n_layer + (int) hparams.n_layer_nextn; ++i) {
+        auto & layer = layers[i];
+
+        layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {2 * n_embd, n_embd}, 0);
+        layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM, "weight", i), {(int64_t)n_embd}, 0);
+        layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM, "weight", i), {(int64_t)n_embd}, 0);
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i),
+                                                     {(int64_t)n_embd}, TENSOR_NOT_REQUIRED);
+
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {(int64_t)n_embd}, 0);
+        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {(int64_t)n_embd}, 0);
+
+        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd_head_k * n_head * 2}, 0);
+        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_head_k * n_head_kv},  0);
+        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_head_k * n_head_kv},  0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd},     0);
+
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {(int64_t)n_embd_head_k}, 0);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {(int64_t)n_embd_head_k}, 0);
+
+        layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, 0);
+        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {(int64_t)n_expert}, 0);
+        layer.ffn_gate_exps = nullptr;
+        layer.ffn_up_exps   = nullptr;
+        create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, hparams.n_expert, 0);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, hparams.n_expert}, 0);
+
+        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, 0);
+        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
+        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
+        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {(int64_t)n_embd}, 0);
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_alice_ai::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -648,6 +727,11 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
     }
     ggml_tensor * hidden = depth_softmax_mix(ctx0, completed, model.output_res_proj, model.output_res_norm,
         hparams.f_norm_rms_eps, -1);
+    if (hparams.n_layer_nextn > 0) {
+        // MTP draft input: the trunk hidden state BEFORE the final norm, all rows
+        // (the graph result marks it as an output; the spec loop feeds it back).
+        res->t_h_nextn = hidden;
+    }
     cur = build_norm(hidden, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -657,6 +741,167 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
     if (std::getenv("ALICE_DUMP_L0") && l0_out) {
         res->t_embd = l0_out;
     }
+    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// ---------------------------------------------------------------------------
+// MTP / nextn draft block (LLM_GRAPH_TYPE_DECODER_MTP).
+//
+// The checkpoint's `mtp.*` tensors become one extra block at index n_layer:
+//   concat(RMSNorm(emb(t+1), enorm), RMSNorm(hidden(t), hnorm)) @ eh_proj
+//   -> gated full attention (own KV cache) -> MoE (+ shared expert) -> RMSNorm(shared head)
+// The block's hidden output becomes t_h_nextn (the next draft's input) and the
+// lm_head produces the draft logits for verification by the main model.
+// ---------------------------------------------------------------------------
+llama_model_alice_ai::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    llm_graph_context(params), model(model) {
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "ALICE_AI MTP requires n_layer_nextn > 0");
+
+    const int64_t n_embd_head = hparams.n_embd_head_k();
+    const int64_t n_head      = hparams.n_head();
+    const int64_t n_head_kv   = hparams.n_head_kv(0);
+    const int64_t n_rot       = hparams.n_rot();
+    const int64_t n_tokens    = ubatch.n_tokens;
+
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "ALICE_AI MTP: missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "ALICE_AI MTP: missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "ALICE_AI MTP: missing nextn.hnorm");
+    GGML_ASSERT(layer.ffn_gate_inp  && "ALICE_AI MTP: missing ffn_gate_inp");
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * tokens_in = inp->tokens;
+    ggml_tensor * embd_in   = inp->embd;
+    ggml_tensor * h_in      = inp->h;
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * tok_embd = ubatch.token ? ggml_get_rows(ctx0, model.tok_embd, tokens_in) : embd_in;
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    ggml_tensor * inp_pos = build_inp_pos();
+    auto * inp_attn = build_attn_inp_kv();
+
+    ggml_tensor * h_norm = build_norm(h_in, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    // ---- gated full attention (identical layout to the trunk's full-attn layers)
+    {
+        ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur);
+        Qcur_full = ggml_reshape_4d(ctx0, Qcur_full, n_embd_head * 2, n_head, n_tokens, 1);
+        ggml_tensor * Qcur = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens, 1,
+            Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], 0);
+        ggml_tensor * gate = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens, 1,
+            Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], n_embd_head * ggml_element_size(Qcur_full));
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+
+        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+
+        const float kq_scale = hparams.f_attention_scale == 0.0f
+            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+        cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
+            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "mtp_attn_pregate", il);
+
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        gate = ggml_sigmoid(ctx0, gate);
+        gate = ggml_reshape_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cur = ggml_mul(ctx0, cur, gate);
+        cur = build_lora_mm(layer.wo, cur);
+        cb(cur, "mtp_attn_out", il);
+    }
+
+    cur = ggml_add(ctx0, cur, inpSA);
+    cb(cur, "mtp_attn_residual", il);
+
+    ggml_tensor * ffn_residual = cur;
+    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    // ---- MoE: sigmoid router + bias correction + shared expert (mirrors the trunk)
+    ggml_tensor * moe_out = build_moe_ffn(cur,
+        layer.ffn_gate_inp,
+        layer.ffn_up_exps,
+        layer.ffn_gate_exps,
+        layer.ffn_down_exps,
+        layer.ffn_exp_probs_b,
+        hparams.n_expert,
+        hparams.n_expert_used(),
+        LLM_FFN_SILU, true,
+        hparams.expert_weights_scale,
+        (llama_expert_gating_func_type) hparams.expert_gating_func,
+        il,
+        nullptr,
+        layer.ffn_gate_up_exps);
+    cb(moe_out, "mtp_ffn_moe_out", il);
+
+    ggml_tensor * ffn_shexp = build_ffn(cur,
+        layer.ffn_up_shexp,   NULL, NULL,
+        layer.ffn_gate_shexp, NULL, NULL,
+        layer.ffn_down_shexp, NULL, NULL,
+        NULL,
+        LLM_FFN_SILU, LLM_FFN_PAR, il);
+    ggml_tensor * shared_gate = ggml_sigmoid(ctx0, build_lora_mm(layer.ffn_gate_inp_shexp, cur));
+    ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+    cur = ggml_add(ctx0, moe_out, ffn_shexp);
+    cb(cur, "mtp_ffn_out", il);
+
+    cur = ggml_add(ctx0, cur, ffn_residual);
+    cb(cur, "mtp_post_ffn", il);
+
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+    cb(cur, "mtp_shared_head_norm", -1);
+
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;

@@ -1141,6 +1141,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_ALICE_AI:
             return true;
         default:
             return false;

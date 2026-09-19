@@ -2612,6 +2612,14 @@ struct alice_moe_probe {
     std::vector<std::vector<int64_t>> counts; // [layer][expert]
     std::vector<double> act2;                 // [layer] sum of ||ffn_inp||^2 over all tokens
 
+    // Teacher-forced route trace (ALICE_MOE_TRACE=<path>): per-position top-k ids
+    // for the first `trace_cap` positions, flattened [layer][pos][k]. This is the
+    // input to the multi-position expert-union / reuse measurement.
+    int64_t trace_cap = 0;
+    int64_t trace_pos = 0;
+    int64_t last_ubatch_tokens = 0;
+    std::vector<int32_t> trace;
+
     void arm(int nlay, int nexp, int ntop);
     void observe(const char * name, const int32_t * ids, int64_t n_ids);
     void observe_act(const char * name, double sum_sq);
@@ -2632,6 +2640,13 @@ struct llama_model_alice_ai : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
         ~graph();
+        const llama_model & model;
+    };
+
+    // MTP / nextn draft block (LLM_GRAPH_TYPE_DECODER_MTP): consumes the trunk's
+    // hidden state plus the next token's embedding.
+    struct graph_mtp : public llm_graph_context {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
         const llama_model & model;
     };
 

@@ -23,7 +23,9 @@ class AliceAIModel(TextModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        self.gguf_writer.add_block_count(self.hparams["num_hidden_layers"])
+        # block_count includes the MTP/nextn blocks: the runtime reads n_layer_all from
+        # it and common_speculative_types_from_gguf() probes blk.{block_count-1}.nextn.eh_proj
+        self.gguf_writer.add_block_count(getattr(self, "block_count", self.hparams["num_hidden_layers"]))
         self.gguf_writer.add_context_length(self.hparams["max_position_embeddings"])
         self.gguf_writer.add_embedding_length(self.hparams["hidden_size"])
         self.gguf_writer.add_feed_forward_length(self.hparams.get(
@@ -36,6 +38,10 @@ class AliceAIModel(TextModel):
             recurrent = [t == "linear_attention" for t in ltypes]
         else:
             recurrent = [(i + 1) % 4 != 0 for i in range(block)]
+        n_mtp = getattr(type(self), "mtp_layers", 0)
+        if n_mtp:
+            # the nextn blocks are plain full-attention blocks
+            recurrent = recurrent + [False] * n_mtp
         self.gguf_writer.add_recurrent_layers(recurrent)
         self.gguf_writer.add_full_attention_interval(4)
 
@@ -113,14 +119,54 @@ class AliceAIModel(TextModel):
     def filter_tensors(cls, item):
         name, gen = item
         if name.startswith("mtp."):
-            # MTP draft head excluded from the trunk GGUF for bring-up
+            # The MTP draft head is EXPORTED, not dropped: Alice's checkpoint uses
+            # the same HF naming as the Qwen/Exaone MTP blocks, so the identical
+            # remap applies (mtp.layers.i.X -> model.layers.{n+i}.X, mtp.fc ->
+            # eh_proj, ...). Consumers that do not want it pass no_mtp=True.
+            if getattr(cls, "no_mtp", False):
+                return None
+            n = getattr(cls, "_n_layer", None)
+            if n is None:
+                return None
+            remapper = {"fc": "eh_proj", "pre_fc_norm_embedding": "enorm",
+                        "pre_fc_norm_hidden": "hnorm", "norm": "shared_head.norm"}
+            parts = name.split(".", 3)
+            if len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
+                cls.mtp_layers = max(getattr(cls, "mtp_layers", 0), int(parts[2]) + 1)
+                return f"model.layers.{n + int(parts[2])}.{parts[3]}", gen
+            if len(parts) == 3 and parts[1] in remapper:
+                return f"model.layers.{n}.{remapper[parts[1]]}.{parts[2]}", gen
             return None
         return super().filter_tensors(item)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        type(self)._n_layer = self.hparams["num_hidden_layers"]
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        n_mtp = getattr(type(self), "mtp_layers", 0)
+        if n_mtp:
+            self.gguf_writer.add_nextn_predict_layers(n_mtp)
 
     def tensor_name(self, name: str, bid: int | None) -> str:
         # tensor_mapping entries carry no suffix; most GGUF tensor names need .weight/.bias,
         # but ssm_a / ssm_dt match the loader's bare names (kimi-linear precedent)
         # ssm_a is loaded bare (SSM_A_NOSCAN has no suffix), ssm_dt is loaded with ".bias"
+        # mtp.* names reach this path from modify_tensors(); remap them onto the
+        # nextn block first (same mapping as filter_tensors) so the table can resolve them.
+        if name.startswith("mtp."):
+            n = getattr(type(self), "_n_layer", None)
+            if n is not None:
+                parts = name.split(".", 3)
+                remapper = {"fc": "eh_proj", "pre_fc_norm_embedding": "enorm",
+                            "pre_fc_norm_hidden": "hnorm", "norm": "shared_head.norm"}
+                if len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
+                    name = f"model.layers.{n + int(parts[2])}.{parts[3]}"
+                    bid = n + int(parts[2])
+                elif len(parts) == 3 and parts[1] in remapper:
+                    name = f"model.layers.{n}.{remapper[parts[1]]}.{parts[2]}"
+                    bid = n
         mapped = self.map_tensor_name(name)
         if bid is not None and mapped == f"blk.{bid}.ssm_a":
             return mapped
