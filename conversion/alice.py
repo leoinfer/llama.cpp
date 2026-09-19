@@ -106,10 +106,11 @@ class AliceAIModel(TextModel):
     def tensor_name(self, name: str, bid: int | None) -> str:
         # tensor_mapping entries carry no suffix; most GGUF tensor names need .weight/.bias,
         # but ssm_a / ssm_dt match the loader's bare names (kimi-linear precedent)
+        # ssm_a is loaded bare (SSM_A_NOSCAN has no suffix), ssm_dt is loaded with ".bias"
         mapped = self.map_tensor_name(name)
-        bare = {"ssm_a", "ssm_dt"}
-        if any(mapped == f"blk.{bid}.{b}" for b in bare):
+        if bid is not None and mapped == f"blk.{bid}.ssm_a":
             return mapped
         if not mapped.endswith((".weight", ".bias")):
-            mapped += ".weight" if not name.endswith(".bias") else ".bias"
+            bias = name.endswith(".bias") or mapped.endswith(".ssm_dt")
+            mapped += ".bias" if bias else ".weight"
         return mapped
