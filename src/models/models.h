@@ -2610,9 +2610,11 @@ struct alice_moe_probe {
     int topk = 0;
     int64_t tokens = 0; // ubatches observed (== forward calls)
     std::vector<std::vector<int64_t>> counts; // [layer][expert]
+    std::vector<double> act2;                 // [layer] sum of ||ffn_inp||^2 over all tokens
 
     void arm(int nlay, int nexp, int ntop);
     void observe(const char * name, const int32_t * ids, int64_t n_ids);
+    void observe_act(const char * name, double sum_sq);
     std::string json() const;
 };
 void alice_moe_probe_write(const alice_moe_probe & probe);

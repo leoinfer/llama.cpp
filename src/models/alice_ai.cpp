@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <mutex>
 #include "llama-memory-recurrent.h"
 
 
@@ -16,7 +17,11 @@
 // Called by the context after every graph compute when the alice probe nodes
 // exist; reads back ffn_moe_topk-<il> via the scheduler's host sync and adds
 // each selected id to its layer histogram. Written once at process exit.
-static thread_local alice_moe_probe g_alice_probe;
+// Process-global, NOT thread_local: graphs are constructed and destroyed from
+// different threads (llama-cli runs the model in a worker and tears the graph
+// down elsewhere), so a per-thread accumulator loses every observation.
+static alice_moe_probe g_alice_probe;
+static std::mutex       g_alice_probe_mu;
 
 void alice_moe_probe::arm(int nlay, int nexp, int ntop) {
     if (active) {
@@ -27,9 +32,27 @@ void alice_moe_probe::arm(int nlay, int nexp, int ntop) {
     n_expert = nexp;
     topk = ntop;
     counts.assign((size_t) nlay, std::vector<int64_t>((size_t) nexp, 0));
+    act2.assign((size_t) nlay, 0.0);
+}
+
+void alice_moe_probe::observe_act(const char * name, double sum_sq) {
+    std::lock_guard<std::mutex> lock(g_alice_probe_mu);
+    if (!active) {
+        return;
+    }
+    const char * dash = strrchr(name, '-');
+    if (!dash) {
+        return;
+    }
+    int il = atoi(dash + 1);
+    if (il < 0 || il >= n_layer) {
+        return;
+    }
+    act2[(size_t) il] += sum_sq;
 }
 
 void alice_moe_probe::observe(const char * name, const int32_t * ids, int64_t n_ids) {
+    std::lock_guard<std::mutex> lock(g_alice_probe_mu);
     if (!active || !ids || n_ids <= 0) {
         return;
     }
@@ -51,7 +74,7 @@ void alice_moe_probe::observe(const char * name, const int32_t * ids, int64_t n_
 }
 
 std::string alice_moe_probe::json() const {
-    std::string out = "{";
+    std::string out;
     char buf[256];
     snprintf(buf, sizeof(buf), "{\"n_layer\":%d,\"n_expert\":%d,\"topk\":%d,\"tokens\":%lld,\"counts\":[",
         n_layer, n_expert, topk, (long long) tokens);
@@ -64,6 +87,22 @@ std::string alice_moe_probe::json() const {
             out += nb;
         }
         out += "]";
+    }
+    out += "],\"act2\":[";
+    const bool dbg = std::getenv("ALICE_DEBUG_PROBE") != nullptr;
+    for (int l = 0; l < n_layer; ++l) {
+        char nb[64];
+        snprintf(nb, sizeof(nb), "%.6g", act2[(size_t) l]);
+        for (char * c = nb; *c; ++c) {
+            if (*c == ',') {
+                *c = '.'; // the process locale may be de_DE; JSON needs '.'
+            }
+        }
+        out += (l ? "," : "");
+        out += nb;
+        if (dbg) {
+            fprintf(stderr, "[probe] json act2[%d/%zu] = %.6g\n", l, act2.size(), act2[(size_t) l]);
+        }
     }
     return out + "]}";
 }
@@ -79,11 +118,21 @@ bool alice_moe_probe_collect(ggml_cgraph * gf, int64_t * out_ids) {
     }
     const char * want = "ffn_moe_topk-";
     const size_t want_len = strlen(want);
+    const char * want_act = "alice_act2-";
+    const size_t want_act_len = strlen(want_act);
     int64_t total = 0;
     const int n_nodes = ggml_graph_n_nodes(gf);
     for (int i = 0; i < n_nodes; ++i) {
         ggml_tensor * t = ggml_graph_node(gf, i);
         if (!t || !t->name[0]) {
+            continue;
+        }
+        if (strncmp(t->name, want_act, want_act_len) == 0) {
+            if (t->type == GGML_TYPE_F32 && ggml_nelements(t) == 1) {
+                float v = 0.0f;
+                ggml_backend_tensor_get(t, &v, 0, sizeof(v));
+                g_alice_probe.observe_act(t->name, (double) v);
+            }
             continue;
         }
         if (strncmp(t->name, want, want_len) != 0) {
@@ -541,6 +590,16 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
             probe_logits = ggml_add(ctx0, probe_logits, layer.ffn_exp_probs_b);
             ggml_tensor * probe_topk = ggml_argsort_top_k(ctx0, probe_logits, hparams.n_expert_used());
             cb(probe_topk, "ffn_moe_topk", il);
+            // cb() only assigns a name; without an expand the tensor has no
+            // consumers and ggml prunes it from the graph (same trap as out_ids).
+            ggml_build_forward_expand(gf, probe_topk);
+
+            // per-layer activation energy in the router input: the imatrix-style
+            // importance signal that scales how much a weight error at this layer
+            // moves the trajectory. One scalar reduction per layer.
+            ggml_tensor * probe_act2 = ggml_sum(ctx0, ggml_sqr(ctx0, ffn_inp));
+            cb(probe_act2, "alice_act2", il);
+            ggml_build_forward_expand(gf, probe_act2);
         }
         ggml_tensor * moe_out = build_moe_ffn(ffn_inp,
             layer.ffn_gate_inp,
