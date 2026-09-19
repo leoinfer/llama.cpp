@@ -61,9 +61,11 @@ void llama_model_alice_ai::load_arch_tensors(llama_model_loader &) {
 
         if (hparams.is_recr(i)) {
             // ---- KDA layer: split projections + 3 separate depthwise convs
-            const int64_t n_head = hparams.n_head();
-            const int64_t key_dim   = n_embd_head_kda * n_head;   // 4096
-            const int64_t value_dim = n_embd_head_kda * n_head;   // 4096
+            // Alice KDA uses its OWN head counts (32/32), independent of attn n_head/n_head_kv
+            const int64_t n_head_k = 32;
+            const int64_t n_head_v = 32;
+            const int64_t key_dim   = n_embd_head_kda * n_head_k;   // 4096
+            const int64_t value_dim = n_embd_head_kda * n_head_v;   // 4096
 
             layer.ssm_q = create_tensor(tn(LLM_TENSOR_SSM_Q, "weight", i), {n_embd, key_dim},   0);
             layer.ssm_k = create_tensor(tn(LLM_TENSOR_SSM_K, "weight", i), {n_embd, key_dim},   0);
@@ -86,11 +88,9 @@ void llama_model_alice_ai::load_arch_tensors(llama_model_loader &) {
             layer.ssm_f_a = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", i), {n_embd, n_embd_head_kda}, 0);
             layer.ssm_f_b = create_tensor(tn(LLM_TENSOR_SSM_F_B, "weight", i), {n_embd_head_kda, key_dim}, 0);
             layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", i), {n_embd, n_embd_head_kda}, 0);
-            layer.ssm_g_b = create_tensor(tn(LLM_TENSOR_SSM_G_B, "weight", i), {n_embd_head_kda, value_dim}, 0);
-
             // beta mixing coefficient; a_log pre-negated at conversion; per-element dt_bias
-            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
-            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {(int64_t)1, (int64_t)n_head}, 0);
+            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head_k}, 0);
+            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {(int64_t)1, (int64_t)n_head_k}, 0);
             layer.ssm_dt   = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {(int64_t)key_dim}, 0);
 
             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {(int64_t)n_embd_head_kda}, 0);
@@ -261,7 +261,8 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
 
             const int64_t head_dim     = hparams.n_embd_head_kda;
             const int64_t d_conv       = hparams.ssm_d_conv;
-            const int64_t d_inner      = head_dim * n_head;
+            const int64_t n_head_kd    = 32;
+            const int64_t d_inner      = head_dim * n_head_kd;
             const int64_t n_seqs       = ubatch.n_seqs;
             const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
@@ -272,28 +273,28 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
             ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
 
-            ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.ssm_q, layer.ssm_q_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, ubatch.n_tokens, kv_head);
-            ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.ssm_k, layer.ssm_k_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, ubatch.n_tokens, kv_head);
-            ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.ssm_v, layer.ssm_v_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, ubatch.n_tokens, kv_head);
+            ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.ssm_q, layer.ssm_q_conv, d_conv, head_dim, n_head_kd, n_seq_tokens, n_seqs, ubatch.n_tokens, kv_head);
+            ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.ssm_k, layer.ssm_k_conv, d_conv, head_dim, n_head_kd, n_seq_tokens, n_seqs, ubatch.n_tokens, kv_head);
+            ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.ssm_v, layer.ssm_v_conv, d_conv, head_dim, n_head_kd, n_seq_tokens, n_seqs, ubatch.n_tokens, kv_head);
 
             // g1 = -exp(a_log) * softplus(f_b(f_a(x)) + dt_bias); a_log pre-negated at convert
             ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
             ggml_tensor * g1  = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
             g1 = ggml_add(ctx0, g1, layer.ssm_dt);
             g1 = ggml_softplus(ctx0, g1);
-            g1 = ggml_reshape_3d(ctx0, g1, head_dim, n_head, ubatch.n_tokens);
-            ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1);
+            g1 = ggml_reshape_3d(ctx0, g1, head_dim, n_head_kd, ubatch.n_tokens);
+            ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kd, 1);
             g1 = ggml_mul(ctx0, g1, A);
-            g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head, n_seq_tokens, n_seqs);
+            g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kd, n_seq_tokens, n_seqs);
 
             // beta = sigmoid(b_proj(x)); Alice has equal k/v heads so no interleave needed
             ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
-            beta = ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs);
+            beta = ggml_reshape_4d(ctx0, beta, 1, n_head_kd, n_seq_tokens, n_seqs);
             beta = ggml_sigmoid(ctx0, beta);
 
             ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
             ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
-            state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
+            state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kd, n_seqs);
 
             const float eps_norm = hparams.f_norm_rms_eps;
             Qcur = build_gdn_l2_norm(ctx0, Qcur, eps_norm);
@@ -311,8 +312,8 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens * n_seqs);
             ggml_tensor * g_a = ggml_mul_mat(ctx0, layer.ssm_g_a, cur_2d);
             ggml_tensor * g2  = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
-            g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head, n_seq_tokens * n_seqs);
-            ggml_tensor * attn_out_final = ggml_reshape_3d(ctx0, output, head_dim, n_head, n_seq_tokens * n_seqs);
+            g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head_kd, n_seq_tokens * n_seqs);
+            ggml_tensor * attn_out_final = ggml_reshape_3d(ctx0, output, head_dim, n_head_kd, n_seq_tokens * n_seqs);
             ggml_tensor * normed = build_norm(attn_out_final, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
             ggml_tensor * gate  = ggml_sigmoid(ctx0, g2);
             ggml_tensor * gated = ggml_mul(ctx0, normed, gate);

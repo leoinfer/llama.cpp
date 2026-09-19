@@ -47,10 +47,12 @@ class AliceAIModel(TextModel):
         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
         self.gguf_writer.add_kda_head_dim(self.hparams["linear_key_head_dim"])
 
-        # MoE: sigmoid router + bias correction + renormalized top-10 weights
         self.gguf_writer.add_expert_count(self.hparams["num_experts"])
         self.gguf_writer.add_expert_used_count(self.hparams["num_experts_per_tok"])
         self.gguf_writer.add_expert_feed_forward_length(self.hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_count(1)
+        self.gguf_writer.add_expert_shared_feed_forward_length(
+            self.hparams["shared_expert_intermediate_size"])
         self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
         self.gguf_writer.add_expert_weights_norm(True)
         self.gguf_writer.add_expert_weights_scale(1.0)
@@ -86,14 +88,23 @@ class AliceAIModel(TextModel):
         if name.endswith(".a_log_bias"):
             data_torch = -torch.exp(data_torch)
 
-        # fused expert tensor -> split into gate/up (proven split0/split1 halves)
+        # fused expert tensor -> keep fused (loader creates split + fused handles)
         if name.endswith("mlp.experts.gate_up_proj"):
-            n_ff = data_torch.shape[-2] // 2
-            gate = data_torch[..., :n_ff, :].contiguous()
-            up = data_torch[..., n_ff:, :].contiguous()
-            base = name.removesuffix(".gate_up_proj")
-            yield (base + ".gate_proj.weight", gate)
-            yield (base + ".up_proj.weight", up)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_UP_EXP, bid), data_torch)
             return
 
-        yield from super().modify_tensors(data_torch, name, bid)
+        yield (self.tensor_name(name, bid), data_torch)
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if name.startswith("mtp."):
+            # MTP draft head excluded from the trunk GGUF for bring-up
+            return None
+        return super().filter_tensors(item)
+
+    def tensor_name(self, name: str, bid: int | None) -> str:
+        mapped = self.map_tensor_name(name)
+        if not mapped.endswith((".weight", ".bias")):
+            mapped += ".weight" if not name.endswith(".bias") else ".bias"
+        return mapped
