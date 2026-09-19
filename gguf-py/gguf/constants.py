@@ -632,6 +632,7 @@ class MODEL_ARCH(IntEnum):
     LLAMA_EMBED      = auto()
     MAINCODER        = auto()
     KIMI_LINEAR      = auto()
+    ALICE_AI         = auto()
     KIMI_K3          = auto()
     TALKIE           = auto()
     MELLUM           = auto()
@@ -738,6 +739,9 @@ class MODEL_TENSOR(IntEnum):
     SSM_IN               = auto()
     SSM_CONV1D           = auto()
     SSM_X                = auto()
+    SSM_Q                = auto() # Alice-AI split KDA projections
+    SSM_K                = auto() # Alice-AI split KDA projections
+    SSM_V                = auto() # Alice-AI split KDA projections
     SSM_DT               = auto()
     SSM_DT_NORM          = auto()
     SSM_A                = auto()
@@ -758,8 +762,14 @@ class MODEL_TENSOR(IntEnum):
     SSM_G_B              = auto() # Kimi Linear
     SSM_G                = auto() # Kimi K3 (full-rank KDA gate, replaces SSM_G_A/SSM_G_B)
     ATTN_RES_SCORE       = auto() # Kimi K3 (fused res_norm * res_proj, pre-attention)
-    FFN_RES_SCORE        = auto() # Kimi K3 (fused res_norm * res_proj, pre-FFN)
+    FFN_RES_SCORE        = auto() # Kimi K3 (fused res_norm * res_proj, pre-ffn)
     OUTPUT_RES_SCORE     = auto() # Kimi K3 (fused res_norm * res_proj, final)
+    ATTN_RES_PROJ        = auto() # Alice-AI split res_proj (pre-attn)
+    ATTN_RES_NORM        = auto() # Alice-AI split res_norm (pre-attn)
+    FFN_RES_PROJ         = auto() # Alice-AI split res_proj (pre-ffn)
+    FFN_RES_NORM         = auto() # Alice-AI split res_norm (pre-ffn)
+    OUTPUT_RES_PROJ      = auto() # Alice-AI split res_proj (final)
+    OUTPUT_RES_NORM      = auto() # Alice-AI split res_norm (final)
     FFN_ROUTED_DOWN      = auto() # Kimi K3 (latent MoE: hidden -> latent)
     FFN_ROUTED_UP        = auto() # Kimi K3 (latent MoE: latent -> hidden)
     FFN_ROUTED_NORM      = auto() # Kimi K3 (latent MoE: norm on expert output)
@@ -1390,6 +1400,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LLAMA_EMBED:      "llama-embed",
     MODEL_ARCH.MAINCODER:        "maincoder",
     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
+    MODEL_ARCH.ALICE_AI:         "alice_ai",
     MODEL_ARCH.KIMI_K3:          "kimi-k3",
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
@@ -1494,6 +1505,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_IN:                    "blk.{bid}.ssm_in",
     MODEL_TENSOR.SSM_CONV1D:                "blk.{bid}.ssm_conv1d",
     MODEL_TENSOR.SSM_X:                     "blk.{bid}.ssm_x",
+    MODEL_TENSOR.SSM_Q:                     "blk.{bid}.ssm_q",
+    MODEL_TENSOR.SSM_K:                     "blk.{bid}.ssm_k",
+    MODEL_TENSOR.SSM_V:                     "blk.{bid}.ssm_v",
     MODEL_TENSOR.SSM_DT:                    "blk.{bid}.ssm_dt",
     MODEL_TENSOR.SSM_DT_NORM:               "blk.{bid}.ssm_dt_norm",
     MODEL_TENSOR.SSM_A:                     "blk.{bid}.ssm_a",
@@ -1516,6 +1530,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_RES_SCORE:            "blk.{bid}.attn_res_score",       # Kimi K3
     MODEL_TENSOR.FFN_RES_SCORE:             "blk.{bid}.ffn_res_score",        # Kimi K3
     MODEL_TENSOR.OUTPUT_RES_SCORE:          "output_res_score",               # Kimi K3
+    MODEL_TENSOR.ATTN_RES_PROJ:             "blk.{bid}.attn_res_proj",        # Alice-AI
+    MODEL_TENSOR.ATTN_RES_NORM:             "blk.{bid}.attn_res_norm",        # Alice-AI
+    MODEL_TENSOR.FFN_RES_PROJ:              "blk.{bid}.ffn_res_proj",         # Alice-AI
+    MODEL_TENSOR.FFN_RES_NORM:              "blk.{bid}.ffn_res_norm",         # Alice-AI
+    MODEL_TENSOR.OUTPUT_RES_PROJ:           "output_res_proj",                # Alice-AI
+    MODEL_TENSOR.OUTPUT_RES_NORM:           "output_res_norm",                # Alice-AI
     MODEL_TENSOR.FFN_ROUTED_DOWN:           "blk.{bid}.ffn_routed_down",      # Kimi K3
     MODEL_TENSOR.FFN_ROUTED_UP:             "blk.{bid}.ffn_routed_up",        # Kimi K3
     MODEL_TENSOR.FFN_ROUTED_NORM:           "blk.{bid}.ffn_routed_norm",      # Kimi K3
@@ -5445,6 +5465,58 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
+    ],
+    MODEL_ARCH.ALICE_AI: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_RES_SCORE,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_RES_SCORE,
+        MODEL_TENSOR.FFN_RES_SCORE,
+        # ATTN (full-attention layers, gated output, fused query||gate)
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K_NORM,
+        # SSM/KDA (linear-attention layers, split projections)
+        MODEL_TENSOR.SSM_Q,
+        MODEL_TENSOR.SSM_K,
+        MODEL_TENSOR.SSM_V,
+        MODEL_TENSOR.SSM_CONV1D_Q,
+        MODEL_TENSOR.SSM_CONV1D_K,
+        MODEL_TENSOR.SSM_CONV1D_V,
+        MODEL_TENSOR.SSM_F_A,
+        MODEL_TENSOR.SSM_F_B,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_G_A,
+        MODEL_TENSOR.SSM_G_B,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_OUT,
+        # FFN / MoE (every layer)
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        # Alice-AI block attention residual (split proj+norm, not fused)
+        MODEL_TENSOR.ATTN_RES_PROJ,
+        MODEL_TENSOR.ATTN_RES_NORM,
+        MODEL_TENSOR.FFN_RES_PROJ,
+        MODEL_TENSOR.FFN_RES_NORM,
+        MODEL_TENSOR.OUTPUT_RES_PROJ,
+        MODEL_TENSOR.OUTPUT_RES_NORM,
     ],
     MODEL_ARCH.KIMI_K3: [
         MODEL_TENSOR.TOKEN_EMBD,

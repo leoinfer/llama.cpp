@@ -250,6 +250,7 @@ class TensorNameMap:
             "layers.{bid}.attn.Wqkv",                                              # modern-bert
             "model.layers.{bid}.self_attn.language_expert_query_key_value",        # cogvlm
             "model.layers.{bid}.linear_attn.in_proj_qkv",                          # qwen3.5
+            "model.layers.{bid}.self_attn.q_proj.weight",                          # alice_ai (query||gate fused)
         ),
 
         # Attention query
@@ -490,6 +491,7 @@ class TensorNameMap:
             "model.layers.{bid}.block_sparse_moe.gate.e_score_correction",  # kimi
             "model.layers.{bid}.moe.router_bias",                           # step3.5 expert selection bias
             "model.layers.{bid}.mlp.experts.e_score_correction",       # laguna
+            "model.layers.{bid}.mlp.gate.e_score_correction_bias",     # alice_ai
         ),
 
         # Feed-forward up
@@ -844,6 +846,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.dt",           # nemotron-h-moe
             "model.layers.{bid}.self_attn.dt_proj",     # kimi
             "model.layers.{bid}.attention.dt_proj",     # bailingmoe3
+            "model.layers.{bid}.linear_attn.dt_bias",   # alice_ai (dt_proj.bias)
         ),
 
         MODEL_TENSOR.SSM_DT_NORM: (
@@ -859,6 +862,7 @@ class TensorNameMap:
             "model.layers.{bid}.linear_attn.A_log",   # qwen3next
             "model.layers.{bid}.self_attn.A_log",     # kimi
             "model.layers.{bid}.attention.A_log",     # bailingmoe3
+            "model.layers.{bid}.linear_attn.a_log_bias",  # alice_ai (pre-negated at convert)
         ),
 
         MODEL_TENSOR.SSM_B_NORM: (
@@ -886,6 +890,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.norm",     # mamba2
             "model.layers.{bid}.self_attn.o_norm",  # kimi
             "model.layers.{bid}.attention.o_norm",  # bailingmoe3
+            "model.layers.{bid}.linear_attn.o_norm.weight",  # alice_ai
         ),
 
         MODEL_TENSOR.SSM_OUT: (
@@ -894,6 +899,7 @@ class TensorNameMap:
             "model.layers.{bid}.mamba.out_proj",         # jamba falcon-h1 granite-hybrid
             "model.layers.{bid}.linear_attn.out_proj",   # qwen3next
             "model.layers.layers.{bid}.mixer.out_proj",  # plamo2
+            "model.layers.{bid}.linear_attn.o_proj.weight",  # alice_ai
         ),
 
         MODEL_TENSOR.SSM_ALPHA: (
@@ -904,29 +910,44 @@ class TensorNameMap:
             "model.layers.{bid}.linear_attn.in_proj_ba",  # qwen3next
         ),
 
-        # Kimi Linear KDA (using SSM_ prefix for consistency)
+        # Alice-AI split KDA projections
+        MODEL_TENSOR.SSM_Q: (
+            "model.layers.{bid}.linear_attn.q_proj.weight",  # alice_ai
+        ),
+        MODEL_TENSOR.SSM_K: (
+            "model.layers.{bid}.linear_attn.k_proj.weight",  # alice_ai
+        ),
+        MODEL_TENSOR.SSM_V: (
+            "model.layers.{bid}.linear_attn.v_proj.weight",  # alice_ai
+        ),
         MODEL_TENSOR.SSM_CONV1D_Q: (
             "model.layers.{bid}.self_attn.q_conv1d",
             "model.layers.{bid}.attention.q_conv1d",
+            "model.layers.{bid}.linear_attn.q_conv1d.weight",
         ),
         MODEL_TENSOR.SSM_CONV1D_K: (
             "model.layers.{bid}.self_attn.k_conv1d",
             "model.layers.{bid}.attention.k_conv1d",
+            "model.layers.{bid}.linear_attn.k_conv1d.weight",
         ),
         MODEL_TENSOR.SSM_CONV1D_V: (
             "model.layers.{bid}.self_attn.v_conv1d",
             "model.layers.{bid}.attention.v_conv1d",
+            "model.layers.{bid}.linear_attn.v_conv1d.weight",
         ),
         MODEL_TENSOR.SSM_F_A: (
             "model.layers.{bid}.self_attn.f_a_proj",
+            "model.layers.{bid}.linear_attn.f_a_proj.weight",
         ),
         MODEL_TENSOR.SSM_F_B: (
             "model.layers.{bid}.self_attn.f_b_proj",
+            "model.layers.{bid}.linear_attn.f_b_proj.weight",
         ),
         MODEL_TENSOR.SSM_BETA: (
             "model.layers.{bid}.linear_attn.in_proj_b",  # qwen3.5
             "model.layers.{bid}.self_attn.b_proj",       # Kimi Linear
             "model.layers.{bid}.attention.b_proj",       # bailingmoe3
+            "model.layers.{bid}.linear_attn.b_proj.weight",
         ),
         # Kimi K3 latent MoE: routed experts operate in a down-projected space
         MODEL_TENSOR.FFN_ROUTED_DOWN: (
@@ -943,9 +964,29 @@ class TensorNameMap:
 
         MODEL_TENSOR.SSM_G_A: (
             "model.layers.{bid}.self_attn.g_a_proj",
+            "model.layers.{bid}.linear_attn.g_a_proj.weight",
         ),
         MODEL_TENSOR.SSM_G_B: (
             "model.layers.{bid}.self_attn.g_b_proj",
+            "model.layers.{bid}.linear_attn.g_b_proj.weight",
+        ),
+        MODEL_TENSOR.ATTN_RES_PROJ: (
+            "model.layers.{bid}.attn_res_proj.weight",  # alice_ai
+        ),
+        MODEL_TENSOR.ATTN_RES_NORM: (
+            "model.layers.{bid}.attn_res_norm_weight",  # alice_ai
+        ),
+        MODEL_TENSOR.FFN_RES_PROJ: (
+            "model.layers.{bid}.mlp_res_proj.weight",  # alice_ai
+        ),
+        MODEL_TENSOR.FFN_RES_NORM: (
+            "model.layers.{bid}.mlp_res_norm_weight",  # alice_ai
+        ),
+        MODEL_TENSOR.OUTPUT_RES_PROJ: (
+            "model.attnres_final.res_proj.weight",  # alice_ai
+        ),
+        MODEL_TENSOR.OUTPUT_RES_NORM: (
+            "model.attnres_final.res_norm_weight",  # alice_ai
         ),
         MODEL_TENSOR.TIME_MIX_W0: (
             "model.layers.{bid}.attention.w0",            # rwkv7
@@ -2761,6 +2802,35 @@ class TensorNameMap:
 
     # architecture-specific block mappings
     arch_block_mappings_cfg: dict[MODEL_ARCH, dict[MODEL_TENSOR, tuple[str, ...]]] = {
+        MODEL_ARCH.ALICE_AI: {
+            MODEL_TENSOR.SSM_Q: (
+                "model.layers.{bid}.linear_attn.q_proj.weight",
+            ),
+            MODEL_TENSOR.SSM_K: (
+                "model.layers.{bid}.linear_attn.k_proj.weight",
+            ),
+            MODEL_TENSOR.SSM_V: (
+                "model.layers.{bid}.linear_attn.v_proj.weight",
+            ),
+            MODEL_TENSOR.ATTN_RES_PROJ: (
+                "model.layers.{bid}.attn_res_proj.weight",
+            ),
+            MODEL_TENSOR.ATTN_RES_NORM: (
+                "model.layers.{bid}.attn_res_norm_weight",
+            ),
+            MODEL_TENSOR.FFN_RES_PROJ: (
+                "model.layers.{bid}.mlp_res_proj.weight",
+            ),
+            MODEL_TENSOR.FFN_RES_NORM: (
+                "model.layers.{bid}.mlp_res_norm_weight",
+            ),
+            MODEL_TENSOR.OUTPUT_RES_PROJ: (
+                "model.attnres_final.res_proj.weight",
+            ),
+            MODEL_TENSOR.OUTPUT_RES_NORM: (
+                "model.attnres_final.res_norm_weight",
+            ),
+        },
         MODEL_ARCH.ARCTIC: {
             MODEL_TENSOR.FFN_NORM: (
                 "model.layers.{bid}.residual_layernorm",

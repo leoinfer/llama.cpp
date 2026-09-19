@@ -152,6 +152,7 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_ALICE_AI,
     LLM_ARCH_KIMI_K3,
     LLM_ARCH_TALKIE,
     LLM_ARCH_MELLUM,
@@ -514,6 +515,9 @@ enum llm_tensor {
     LLM_TENSOR_SSM_IN,
     LLM_TENSOR_SSM_CONV1D,
     LLM_TENSOR_SSM_X,
+    LLM_TENSOR_SSM_Q,               // alice_ai: split KDA q projection
+    LLM_TENSOR_SSM_K,               // alice_ai: split KDA k projection
+    LLM_TENSOR_SSM_V,               // alice_ai: split KDA v projection
     LLM_TENSOR_SSM_DT,
     LLM_TENSOR_SSM_DT_NORM,
     LLM_TENSOR_SSM_A,
@@ -538,6 +542,12 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_RES_SCORE,      // kimi-k3: fused res_norm*res_proj (pre-attn)
     LLM_TENSOR_FFN_RES_SCORE,       // kimi-k3: fused res_norm*res_proj (pre-ffn)
     LLM_TENSOR_OUTPUT_RES_SCORE,    // kimi-k3: fused res_norm*res_proj (final)
+    LLM_TENSOR_ATTN_RES_PROJ,       // alice_ai: split res_proj (pre-attn), Linear(H,1)
+    LLM_TENSOR_ATTN_RES_NORM,       // alice_ai: split res_norm (pre-attn)
+    LLM_TENSOR_FFN_RES_PROJ,        // alice_ai: split res_proj (pre-ffn), Linear(H,1)
+    LLM_TENSOR_FFN_RES_NORM,        // alice_ai: split res_norm (pre-ffn)
+    LLM_TENSOR_OUTPUT_RES_PROJ,     // alice_ai: split res_proj (final), Linear(H,1)
+    LLM_TENSOR_OUTPUT_RES_NORM,     // alice_ai: split res_norm (final)
     LLM_TENSOR_FFN_ROUTED_DOWN,     // kimi-k3: latent MoE down
     LLM_TENSOR_FFN_ROUTED_UP,       // kimi-k3: latent MoE up
     LLM_TENSOR_FFN_ROUTED_NORM,     // kimi-k3: latent MoE norm
