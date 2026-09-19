@@ -394,6 +394,9 @@ llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * hidden = depth_softmax_mix(ctx0, completed, model.output_res_proj, model.output_res_norm,
         hparams.f_norm_rms_eps, -1);
     cur = build_norm(hidden, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
     cur = ggml_mul_mat(ctx0, model.output, cur);
