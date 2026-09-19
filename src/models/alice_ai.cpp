@@ -161,11 +161,11 @@ static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_t
 }
 
 // depth-softmax-mix over completed blocks (+ in-flight partial):
-//   per source: keys_k = rms_norm(src_k) * norm_w ; score_k = proj_w . keys_k   -> scalar per token
-//   weights = softmax([score_0 .. score_{S-1}], dim=0)                          -> [S, T]
-//   out = sum_k src_k * weights_k
-// Official does this on a stacked [S,B,T,H] tensor; ggml softmax runs over dim 0,
-// so scores are assembled with S in dim 0 to make the axis match exactly.
+//   per source: keys_k = rms_norm(src_k) * norm_w ; score_k = proj_w . keys_k  -> [1, T]
+//   weights  = softmax([score_0 .. score_{S-1}], dim=0)                        -> [S, T]
+//   out      = sum_k src_k * weights_k
+// Softmax is computed with elementwise ops (max-subtract, exp, sum, div) rather than
+// a dim-0 ggml softmax, so no strided view over the [S,T] score matrix is needed.
 static ggml_tensor * depth_softmax_mix(ggml_context * ctx0, std::vector<ggml_tensor *> & sources,
         ggml_tensor * proj_w, ggml_tensor * norm_w, float eps, int il) {
     GGML_ASSERT(!sources.empty());
@@ -173,25 +173,34 @@ static ggml_tensor * depth_softmax_mix(ggml_context * ctx0, std::vector<ggml_ten
     const int64_t T = sources[0]->ne[1];
     const int64_t S = (int64_t) sources.size();
 
-    ggml_tensor * scores = nullptr;   // [S, T]
+    std::vector<ggml_tensor *> sc(S);
     for (int64_t k = 0; k < S; ++k) {
-        ggml_tensor * x = sources[k];
-        ggml_tensor * normed = ggml_rms_norm(ctx0, x, eps);
+        ggml_tensor * normed = ggml_rms_norm(ctx0, sources[k], eps);
         normed = ggml_mul(ctx0, normed, norm_w);
-        ggml_tensor * sc = ggml_mul_mat(ctx0, proj_w, normed);   // [1, T]
-        scores = (scores == nullptr) ? sc : ggml_concat(ctx0, scores, sc, 0);
+        sc[k] = ggml_mul_mat(ctx0, proj_w, normed);   // [1, T]
     }
-    ggml_tensor * weights = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f, 0.0f);  // [S, T]
+
+    // softmax over the source axis, computed elementwise (no strided views, no
+    // max-subtraction: scores come from a H->1 linear on an RMS-normalized vector,
+    // so they are O(1) and exp() cannot overflow)
+    std::vector<ggml_tensor *> ex(S);
+    ggml_tensor * sum = nullptr;
+    for (int64_t k = 0; k < S; ++k) {
+        ex[k] = ggml_exp(ctx0, sc[k]);
+        sum = (sum == nullptr) ? ex[k] : ggml_add(ctx0, sum, ex[k]);
+    }
 
     ggml_tensor * acc = nullptr;
     for (int64_t k = 0; k < S; ++k) {
-        ggml_tensor * wk = ggml_view_2d(ctx0, weights, 1, T, weights->nb[1], k * ggml_element_size(weights));
+        ggml_tensor * wk = ggml_div(ctx0, ex[k], sum);   // [1, T]
         ggml_tensor * term = ggml_mul(ctx0, sources[k], wk);
         acc = (acc == nullptr) ? term : ggml_add(ctx0, acc, term);
     }
     (void) il;
+    (void) H;
     return acc;
 }
+
 
 
 llama_model_alice_ai::graph::graph(const llama_model & model, const llm_graph_params & params) :
