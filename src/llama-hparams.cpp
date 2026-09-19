@@ -217,9 +217,11 @@ uint32_t llama_hparams::n_embd_r() const {
     }
 
     if (n_embd_head_kda != 0) {
-        // for Kimi KDA layers
-        // Conv state for Q, K, V: 3 * (d_conv - 1) * n_head * head_dim
-        const uint32_t d_inner = n_head() * n_embd_head_kda;  // 32 * 128 = 4096
+        // for KDA layers (kimi-linear, alice_ai)
+        // Conv state for Q, K, V: 3 * (d_conv - 1) * n_kda_heads * head_dim
+        // ssm_n_group carries the KDA head count when it differs from n_head (alice_ai: 32 vs 16)
+        const uint32_t n_kda_heads = ssm_n_group > 0 ? ssm_n_group : n_head();
+        const uint32_t d_inner = n_kda_heads * n_embd_head_kda;
         return 3 * (ssm_d_conv > 0 ? ssm_d_conv - 1 : 3) * d_inner;
     }
 
@@ -240,10 +242,11 @@ uint32_t llama_hparams::n_embd_s() const {
     }
 
     if (n_embd_head_kda != 0) {
-        // for Kimi KDA layers
-        // Full recurrent state: head_dim * head_dim * n_head
-        // h tensor shape for delta attention: [head_dim, head_dim, n_head]
-        return n_embd_head_kda * n_embd_head_kda * n_head();  // 128 * 128 * 32 = 524288
+        // for KDA layers (kimi-linear, alice_ai)
+        // Full recurrent state: head_dim * head_dim * n_kda_heads
+        // h tensor shape for delta attention: [head_dim, head_dim, n_heads]
+        const uint32_t n_kda_heads = ssm_n_group > 0 ? ssm_n_group : n_head();
+        return n_embd_head_kda * n_embd_head_kda * n_kda_heads;
     }
 
     if (n_embd_head_la != 0) {

@@ -46,6 +46,8 @@ class AliceAIModel(TextModel):
         # KDA geometry
         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
         self.gguf_writer.add_kda_head_dim(self.hparams["linear_key_head_dim"])
+        # KDA head count drives conv/recurrent state sizing and differs from attn heads
+        self.gguf_writer.add_ssm_group_count(self.hparams["linear_num_key_heads"])
 
         self.gguf_writer.add_expert_count(self.hparams["num_experts"])
         self.gguf_writer.add_expert_used_count(self.hparams["num_experts_per_tok"])

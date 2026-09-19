@@ -19,6 +19,12 @@ void llama_model_alice_ai::load_arch_hparams(llama_model_loader & ml) {
     // KDA geometry: per-element decay, key_dim = 32*128 = 4096, value_dim = 4096
     ml.get_key(LLM_KV_SSM_CONV_KERNEL, hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,    hparams.n_embd_head_kda);
+    // KDA head count (32) differs from attention head count (16); this drives the
+    // conv/recurrent state sizing in llama_hparams::n_embd_r()/n_embd_s()
+    ml.get_key(LLM_KV_SSM_GROUP_COUNT, hparams.ssm_n_group, false);
+    if (hparams.ssm_n_group == 0) {
+        hparams.ssm_n_group = 32;
+    }
 
     // MoE: sigmoid router + bias correction, renormalized top-k, shared expert, scale 1.0
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
