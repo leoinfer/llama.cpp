@@ -338,6 +338,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
             return new llama_model_kimi_linear(params);
+        case LLM_ARCH_ALICE_AI:
+            return new llama_model_alice_ai(params);
         case LLM_ARCH_KIMI_K3:
             return new llama_model_kimi_k3(params);
         case LLM_ARCH_STEP35:
@@ -3041,6 +3043,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_AFMOE:
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_ALICE_AI:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_SPARK2_5:

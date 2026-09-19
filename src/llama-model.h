@@ -538,12 +538,19 @@ struct llama_layer {
     struct ggml_tensor * ssm_q_conv = nullptr;
     struct ggml_tensor * ssm_k_conv = nullptr;
     struct ggml_tensor * ssm_v_conv = nullptr;
+    struct ggml_tensor * ssm_q      = nullptr; // alice_ai: split KDA q projection
+    struct ggml_tensor * ssm_k      = nullptr; // alice_ai: split KDA k projection
+    struct ggml_tensor * ssm_v      = nullptr; // alice_ai: split KDA v projection
     struct ggml_tensor * ssm_f_a    = nullptr;
     struct ggml_tensor * ssm_f_b    = nullptr;
     struct ggml_tensor * ssm_beta   = nullptr;
     struct ggml_tensor * ssm_g_a    = nullptr;
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
+    struct ggml_tensor * attn_res_proj  = nullptr; // alice_ai: split Linear(H,1)
+    struct ggml_tensor * attn_res_norm  = nullptr; // alice_ai
+    struct ggml_tensor * ffn_res_proj   = nullptr; // alice_ai: split Linear(H,1)
+    struct ggml_tensor * ffn_res_norm   = nullptr; // alice_ai
 
     // kimi-k3
     struct ggml_tensor * ssm_g           = nullptr; // full-rank KDA gate (replaces ssm_g_a/ssm_g_b)
@@ -629,6 +636,8 @@ struct llama_model {
 
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
+    struct ggml_tensor * output_res_proj = nullptr; // alice_ai: split Linear(H,1)
+    struct ggml_tensor * output_res_norm = nullptr; // alice_ai
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
