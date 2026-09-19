@@ -125,6 +125,8 @@ class AliceAIModel(TextModel):
         if bid is not None and mapped == f"blk.{bid}.ssm_a":
             return mapped
         if not mapped.endswith((".weight", ".bias")):
-            bias = name.endswith(".bias") or mapped.endswith(".ssm_dt")
+            # exp_probs_b is the router's bias-correction vector even though the HF
+            # name ends in "_bias", not ".bias"; the loader expects ".bias".
+            bias = name.endswith(".bias") or mapped.endswith(".ssm_dt") or mapped.endswith(".exp_probs_b")
             mapped += ".bias" if bias else ".weight"
         return mapped
