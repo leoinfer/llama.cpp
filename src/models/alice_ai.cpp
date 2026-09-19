@@ -90,7 +90,7 @@ void llama_model_alice_ai::load_arch_tensors(llama_model_loader &) {
             layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", i), {n_embd, n_embd_head_kda}, 0);
             // beta mixing coefficient; a_log pre-negated at conversion; per-element dt_bias
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head_k}, 0);
-            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {(int64_t)1, (int64_t)n_head_k}, 0);
+            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {(int64_t)n_head_k}, 0);
             layer.ssm_dt   = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {(int64_t)key_dim}, 0);
 
             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {(int64_t)n_embd_head_kda}, 0);
