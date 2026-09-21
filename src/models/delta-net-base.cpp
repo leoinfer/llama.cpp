@@ -398,8 +398,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
-    // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    // K = n_rs_seq + 1 snapshot slots when rollback is enabled (speculative
+    // decoding), else 1 (final state only). state s is 4D [S_v, S_v, H_v, n_seqs].
+    // The shader writes per-token snapshots for K > 1 (slot 0 = most recent).
+    const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {

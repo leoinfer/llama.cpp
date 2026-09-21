@@ -1,7 +1,10 @@
+#include <cstdlib>
+#include <cstdio>
 #include "llama-graph.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "models/models.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2153,6 +2156,110 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (hotbank.partition != nullptr && hotbank.hotbank_model != nullptr) {
+        // ALICE_MOE_COMPACT (ALICE_HOTBANK=1): one CUSTOM op per layer that
+        // partitions the routed ids by residency and executes EXACTLY the hot
+        // experts on the GPU compact bank and EXACTLY the cold experts on the
+        // CPU host bank — no zero-weight dummy rows on either side. The op
+        // reads the model LUT + compact VRAM tensors from userdata; hot runs on
+        // the Vulkan backend (weight-following), cold on the CPU backend, and
+        // both write into one output so the join is the op boundary itself.
+        // See ALICE_HOTBANK_RUNTIME_DESIGN.md; tensors are model-owned.
+        const auto * am = static_cast<const llama_model_alice_ai *>(hotbank.hotbank_model);
+        const ggml_tensor * hgu = am->hot_gu[il];
+        const ggml_tensor * hdn = am->hot_dn[il];
+        if (hgu != nullptr && hdn != nullptr && hgu->ne[2] > 0) {
+            const int64_t n_ff = gate_up_exps->ne[1] / 2;
+            // 1) partition op (host): writes hot-local ids + hot weights into
+            //    graph tensors AND computes the exact-count cold partial.
+            ggml_tensor * a_ids[2] = { selected_experts, weights };
+            ggml_tensor * hot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens, 1, 1,
+                                                   a_ids, 2, hotbank.partition, GGML_N_TASKS_MAX,
+                                                   (void *) ((alice_hotbank_part_ud *) hotbank.userdata + il));
+            cb(hot_ids, "ffn_moe_hot_ids", il);
+            // cold side: op A (gate/up partials) then op B (down + weighted
+            // reduce). Scheduler ordering between the two gives the barrier.
+            ggml_tensor * a_gu[3] = { cur, selected_experts, gate_up_exps };
+            ggml_tensor * cold_gu = ggml_custom_4d(ctx0, GGML_TYPE_F32, 2 * n_ff, n_expert_used, n_tokens, 1,
+                                                   a_gu, 3, hotbank.cold_gu, GGML_N_TASKS_MAX,
+                                                   (void *) ((alice_hotbank_part_ud *) hotbank.userdata + il));
+            cb(cold_gu, "ffn_moe_cold_gu", il);
+            ggml_tensor * a_dn[4] = { cold_gu, selected_experts, weights, down_exps };
+            ggml_tensor * cold_out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
+                                                    a_dn, 4, hotbank.cold, GGML_N_TASKS_MAX,
+                                                    (void *) ((alice_hotbank_part_ud *) hotbank.userdata + il));
+            cb(cold_out, "ffn_moe_cold", il);
+            // 2) hot side on the GPU compact bank (dummies carry weight 0; the
+            //    GPU side is ~34 us/layer so its width is not the bottleneck).
+            ggml_tensor * cur3 = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+            ggml_tensor * gu_hot = build_lora_mm_id(const_cast<ggml_tensor *>(hgu), cur3, hot_ids, nullptr);
+            cb(gu_hot, "ffn_moe_hot_gate_up", il);
+            ggml_tensor * h_gate = ggml_view_3d(ctx0, gu_hot, n_ff, n_expert_used, n_tokens, gu_hot->nb[1], gu_hot->nb[2], 0);
+            ggml_tensor * h_up   = ggml_view_3d(ctx0, gu_hot, n_ff, n_expert_used, n_tokens, gu_hot->nb[1], gu_hot->nb[2], n_ff * gu_hot->nb[0]);
+            ggml_tensor * h_act  = ggml_swiglu_split(ctx0, h_gate, h_up);
+            cb(h_act, "ffn_moe_hot_swiglu", il);
+            ggml_tensor * dn_hot = build_lora_mm_id(const_cast<ggml_tensor *>(hdn), h_act, hot_ids, nullptr);
+            cb(dn_hot, "ffn_moe_hot_down", il);
+            // hot weights: gather from the published weights tensor
+            ggml_tensor * hot_w = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, n_expert_used, n_tokens, 1,
+                                                 a_ids, 2, hotbank.weights, GGML_N_TASKS_MAX,
+                                                 (void *) ((alice_hotbank_part_ud *) hotbank.userdata + il));
+            cb(hot_w, "ffn_moe_hot_w", il);
+            ggml_tensor * hot_part = ggml_mul(ctx0, dn_hot, hot_w);
+            cb(hot_part, "ffn_moe_hot_weighted", il);
+            // 3) reduce hot over the expert axis (views+adds), then single join
+            ggml_tensor * hv = ggml_view_2d(ctx0, hot_part, n_embd, n_tokens, hot_part->nb[2], 0);
+            for (int64_t j = 1; j < n_expert_used; ++j) {
+                hv = ggml_add(ctx0, hv, ggml_view_2d(ctx0, hot_part, n_embd, n_tokens, hot_part->nb[2], j * hot_part->nb[1]));
+            }
+            ggml_tensor * moe_out = ggml_add(ctx0, cold_out, hv);
+            cb(moe_out, "ffn_moe_out", il);
+            ggml_build_forward_expand(gf, moe_out);
+            return moe_out;
+        }
+    }
+
+    if (fused_moe.quant_x != nullptr) {
+        // Staged, row-parallel fused CPU MoE. Five nodes instead of the deployed thirteen
+        // (gate_up matmul_id, swiglu_split, down matmul_id, weight mul, nine view/add), and
+        // every stage partitions rows so the backend's whole thread team stays busy.
+        ggml_tensor * x_f = ggml_reshape_2d(ctx0, cur,    n_embd,        n_tokens);
+        ggml_tensor * w_f = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        const ggml_tensor * gu = static_cast<const llm_graph_context *>(this) ? nullptr : nullptr; // (layer tensors come via userdata)
+        GGML_UNUSED(gu);
+        const int64_t n_ff   = gate_up_exps->ne[1] / 2;
+        const ggml_type vq   = ggml_get_type_traits_cpu(gate_up_exps->type)->vec_dot_type;
+        const int64_t row_x  = (int64_t) ggml_row_size(vq, n_embd);
+        const int64_t row_h  = (int64_t) ggml_row_size(vq, n_ff);
+
+        ggml_tensor * a_x[1] = { x_f };
+        ggml_tensor * q_x = ggml_custom_4d(ctx0, GGML_TYPE_I8, row_x, n_tokens, 1, 1,
+                                           a_x, 1, fused_moe.quant_x, GGML_N_TASKS_MAX, fused_moe.userdata);
+        cb(q_x, "ffn_moe_qx", il);
+
+        ggml_tensor * a_gu[2] = { q_x, selected_experts };
+        ggml_tensor * gu_out = ggml_custom_4d(ctx0, GGML_TYPE_F32, 2 * n_ff, n_expert_used, n_tokens, 1,
+                                              a_gu, 2, fused_moe.gate_up, GGML_N_TASKS_MAX, fused_moe.userdata);
+        cb(gu_out, "ffn_moe_gate_up_fused", il);
+
+        ggml_tensor * a_sw[1] = { gu_out };
+        ggml_tensor * aq = ggml_custom_4d(ctx0, GGML_TYPE_I8, row_h, n_expert_used, n_tokens, 1,
+                                          a_sw, 1, fused_moe.swiglu, GGML_N_TASKS_MAX, fused_moe.userdata);
+        cb(aq, "ffn_moe_act_q", il);
+
+        ggml_tensor * a_dn[3] = { aq, selected_experts, w_f };
+        ggml_tensor * partials = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens, 1,
+                                                a_dn, 3, fused_moe.down, GGML_N_TASKS_MAX, fused_moe.userdata);
+        cb(partials, "ffn_moe_partials", il);
+
+        ggml_tensor * a_red[1] = { partials };
+        ggml_tensor * out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
+                                           a_red, 1, fused_moe.reduce, GGML_N_TASKS_MAX, fused_moe.userdata);
+        cb(out, "ffn_moe_fused", il);
+        ggml_build_forward_expand(gf, out);
+        return out;
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 

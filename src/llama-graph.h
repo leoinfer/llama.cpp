@@ -1036,6 +1036,40 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // Optional per-arch hook: replace the MoE expert chain (gate_up + down matmuls,
+    // swiglu, and the 9-add expert aggregation) with a single fused op whose
+    // implementation is owned by the arch. Left null by every arch that does not
+    // set it, so the shared MoE builder is unchanged for them.
+    //   a = activations [n_embd, n_tokens] f32
+    //   b = selected experts [n_expert_used, n_tokens] i32
+    //   c = routing weights [n_expert_used, n_tokens] f32
+    //   dst = [n_embd, n_tokens] f32
+    // Five balanced stages. The first attempt fused everything into one op with
+    // expert-sized work items (10 items over 8 threads) and lost 15% end-to-end:
+    // row-granular parallel work is what keeps the team busy, so each stage below
+    // partitions rows, not experts.
+    struct fused_moe_hooks {
+        ggml_custom_op_t quant_x = nullptr;   // x          -> q8_K activations
+        ggml_custom_op_t gate_up = nullptr;   // gate_up rows
+        ggml_custom_op_t swiglu  = nullptr;   // swiglu + down + weights
+        ggml_custom_op_t down    = nullptr;   // down rows, weighted
+        ggml_custom_op_t reduce  = nullptr;   // expert-axis reduction
+        void * userdata = nullptr;
+    } fused_moe;
+
+    // Hot-bank hooks (ALICE_HOTBANK=1). partition runs at COMPUTE time to split
+    // selected experts into hot-local / cold-global ids + split routing weights
+    // (needs ids DATA, so it is a CUSTOM op, not a build-time transform).
+    // hotbank_model supplies the per-layer compact VRAM banks + LUT.
+    struct hotbank_hooks {
+        ggml_custom_op_t partition = nullptr;   // ids + weights publication
+        ggml_custom_op_t cold_gu   = nullptr;   // cold gate/up partials
+        ggml_custom_op_t cold      = nullptr;   // cold down + weighted reduce
+        ggml_custom_op_t weights   = nullptr;   // hot weight gather
+        const struct llama_model * hotbank_model = nullptr;
+        void * userdata = nullptr;
+    } hotbank;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

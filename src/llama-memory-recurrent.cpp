@@ -10,7 +10,8 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
-#include <map>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 //
@@ -1291,6 +1292,10 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }
@@ -1319,6 +1324,14 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             // reset rollback idx
             mem->rs_idx[seq] = 0;
         }
+    }
+    // ALICE_MTP_DIVERGENCE_DUMP=1: s_copy plane discriminator (rank-1 suspect).
+    // Nonzero plane with no seq_rm since last build = single-use rs_idx consumed
+    // at input build while a later path replays plane0 = the rank-1 signature.
+    // Zero cost when unset (single getenv per call; hot path already branches).
+    if (std::getenv("ALICE_MTP_DIVERGENCE_DUMP")) {
+        fprintf(stderr, "[mtp-divdump] s_copy i=%d cell=%u src0=%d plane=%u\n",
+            i, cell_idx, src0, idx);
     }
     return (int32_t)(idx * mem->size) + src0;
 }

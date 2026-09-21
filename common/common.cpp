@@ -1621,10 +1621,15 @@ done:
     return res;
 }
 
-static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+// ALICE_MTP_DIVERGENCE_DUMP=1: tags which memory (target vs draft) refused the
+// removal, so a K>1 rollback abort localizes to one context instead of guessing.
+enum class common_context_seq_rm_tag { TGT, DFT };
+
+static void common_context_seq_rm(common_context_seq_rm_tag tag, llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d (%s memory)\n",
+            seq_id, p0, p1, tag == common_context_seq_rm_tag::TGT ? "target" : "draft").c_str());
     }
 }
 
@@ -1644,9 +1649,9 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
 }
 
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    common_context_seq_rm(common_context_seq_rm_tag::TGT, ctx_tgt, seq_id, p0, p1);
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        common_context_seq_rm(common_context_seq_rm_tag::DFT, ctx_dft, seq_id, p0, p1);
     }
 }
 

@@ -2632,10 +2632,54 @@ void alice_moe_probe_write(const alice_moe_probe & probe);
 // caller can derive tokens; returns false when the probe is not armed.
 bool alice_moe_probe_collect(ggml_cgraph * gf, int64_t * out_ids);
 
+// Hot-bank residency (ALICE_HOTBANK=1): per-(layer,expert) VRAM duplicates.
+// Compact tensors live in VRAM with USAGE_WEIGHTS so weight-following assigns
+// their mul_mat_id to the GPU; the LUT maps global expert id -> hot-local index
+// (or -1). Implementation in src/models/alice_ai.cpp. KILLED approaches this
+// does NOT revive: -ot shexp (0.894x), fused arrangement (0.85-0.89x),
+// MIN_BATCH=1 (0.34-0.56x). Receipt: ALICE_HOTBANK_RUNTIME_DESIGN.md.
+struct alice_hotbank_lut {
+    int16_t local[512];
+    int n_hot = 0;
+};
+// Partition-op userdata (ALICE_HOTBANK=1); defined here so the model struct can
+// own a vector of them (same lifetime rule as fused_moe_ud).
+struct alice_moe_block_ud {
+    const struct llama_model * model;
+    int il;
+};
+struct alice_fused_moe_ud {
+    const struct llama_model * model;
+    int il;
+};
+struct alice_hotbank_part_ud {
+    const struct llama_model * amodel;
+    int il;
+};
 struct llama_model_alice_ai : public llama_model_base {
     llama_model_alice_ai(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // Hot-bank VRAM duplicates (ALICE_HOTBANK=1). Owned by the MODEL (same
+    // lifetime rule as fused_moe_ud: graph nodes must not point at freed memory).
+    // hot_gu/dn[il] = compact [row_elems, rows_total] VRAM tensors for CPU layers
+    // (rows_total = n_hot_units * rows_per_unit); nullptr on GPU layers (their
+    // banks are already resident) and when ALICE_HOTBANK is unset.
+    mutable struct ggml_tensor * hot_gu[48] = {};
+    mutable struct ggml_tensor * hot_dn[48] = {};
+    mutable struct ggml_backend_buffer * hot_bufs[48] = {};
+    mutable alice_hotbank_lut hot_lut[48];
+    mutable bool hot_enabled = false;
+    mutable std::vector<alice_hotbank_part_ud> hot_part_ud;
+    // Per-layer userdata for the optional fused CPU MoE executor (ALICE_FUSED_MOE=1).
+    // Owned by the MODEL, not by the graph: the node built during graph construction
+    // keeps this pointer in its op_params, and the graph object does not outlive the
+    // compute that reads it (measured: a graph-owned table showed up as freed memory).
+    mutable std::vector<alice_fused_moe_ud> fused_moe_ud;
+    // Per-layer userdata for ALICE_MOE_BLOCK (2-node composite CPU MoE).
+    // Same lifetime rule as fused_moe_ud: owned by the model.
+    mutable std::vector<alice_moe_block_ud> moe_block_ud;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

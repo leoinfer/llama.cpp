@@ -76,6 +76,11 @@ class AliceAIModel(TextModel):
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.25)))
 
+        # MTP / nextn draft block count (0 = not exported)
+        n_mtp = getattr(type(self), "mtp_layers", 0)
+        if n_mtp:
+            self.gguf_writer.add_nextn_predict_layers(n_mtp)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # zero-centred RMSNorm gains: fold +1 at conversion (matches proven converter table)
         if name.endswith((
@@ -84,6 +89,14 @@ class AliceAIModel(TextModel):
             "self_attn.q_norm.weight",
             "self_attn.k_norm.weight",
             "model.norm.weight",
+            # MTP / nextn block: same zero-centred RMSNorm family as the trunk
+            # (AliceAIRMSNorm(zero_centered=True) folds as scale = 1 + weight).
+            # enorm/hnorm carry raw negative gains (-0.435 / -0.202 mean), which are
+            # only sane under this convention; shared_head.norm plays the trunk's
+            # final-norm role, which is zero-centred in the official model.
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
         )):
             data_torch = data_torch + 1
 
@@ -143,11 +156,6 @@ class AliceAIModel(TextModel):
         type(self)._n_layer = self.hparams["num_hidden_layers"]
         return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
-    def set_gguf_parameters(self):
-        super().set_gguf_parameters()
-        n_mtp = getattr(type(self), "mtp_layers", 0)
-        if n_mtp:
-            self.gguf_writer.add_nextn_predict_layers(n_mtp)
 
     def tensor_name(self, name: str, bid: int | None) -> str:
         # tensor_mapping entries carry no suffix; most GGUF tensor names need .weight/.bias,

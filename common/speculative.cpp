@@ -18,7 +18,8 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
-#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1591,9 +1592,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
-
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            // ALICE_MTP_DIVERGENCE_DUMP=1: K=1 first-divergence discriminator.
+            // Logs n_rows + verify_h/pending_h row hashes per seq. Zero cost when
+            // unset. Compare K=0 reference vs K=1 code_slice: first divergent row
+            // decides rank-2 (stale pending) vs rank-3 (logits rows) vs rank-5.
+            if (std::getenv("ALICE_MTP_DIVERGENCE_DUMP")) {
+                uint64_t hh = 1469598103934665603ULL;
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const uint64_t * w = (const uint64_t *) (verify_h[seq_id].data() + (size_t) i * n_embd);
+                    for (int k = 0; k < n_embd / 2; ++k) { hh ^= w[k]; hh *= 1099511628211ULL; }
+                }
+                const uint64_t * wp = (const uint64_t *) pending_h[seq_id].data();
+                uint64_t hp = 1469598103934665603ULL;
+                for (int k = 0; k < n_embd / 2; ++k) { hp ^= wp[k]; hp *= 1099511628211ULL; }
+                fprintf(stderr, "[mtp-divdump] process seq=%d n_rows=%d verify_h=%016llx pending_h=%016llx\n",
+                    (int) seq_id, (int) n_rows, (unsigned long long) hh, (unsigned long long) hp);
+            }
         }
 
         return true;

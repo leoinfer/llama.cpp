@@ -17,7 +17,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
-#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -3940,9 +3941,16 @@ private:
 
                         const auto & ckpt = slot.spec_ckpt;
 
-                        SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+                        // ALICE_MTP_DIVERGENCE_DUMP=1: framing discriminator.
+                        // Logs restore-vs-accept inputs every iteration. Zero cost
+                        // when unset. Decides rank-2 (framing) vs rank-5 (coverage).
+                        if (std::getenv("ALICE_MTP_DIVERGENCE_DUMP")) {
+                            fprintf(stderr, "[mtp-divdump] restore? n_draft=%zu n_accepted=%zu n_rollback=%u ckpt_pos=[%d,%d] ckpt_n_tokens=%lld ckpt_bytes=%zu\n",
+                                slot.spec_draft.size(), accepted.size(), n_rollback,
+                                ckpt.pos_min, ckpt.pos_max, (long long) ckpt.n_tokens, ckpt.size());
+                        }
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);

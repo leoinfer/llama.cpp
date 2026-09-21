@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -1130,6 +1131,19 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
 }
 
 bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+    // LLM_ARCH_ALICE_AI is gated behind ALICE_MTP_K_SNAP=1: the per-token
+    // recurrent snapshots (conv + S-state, K=n_rs_seq+1 planes) are written by
+    // alice_ai.cpp only when that env is set. Without it a rejected draft leaves
+    // a corrupted recurrent/conv state (measured 2026-09-19: acceptance < 1.0
+    // diverges from the K=0 control; acceptance == 1.0 is byte-identical), so
+    // the default must stay clamped to n_rs_seq=0 (checkpoint-based recovery).
+    static const bool alice_ksnap = [] {
+        const char * e = getenv("ALICE_MTP_K_SNAP");
+        return e != nullptr && e[0] != '0';
+    }();
+    if (arch == LLM_ARCH_ALICE_AI) {
+        return alice_ksnap;
+    }
     switch (arch) {
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN35:
@@ -1141,7 +1155,6 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_BAILINGMOE3:
-        case LLM_ARCH_ALICE_AI:
             return true;
         default:
             return false;
