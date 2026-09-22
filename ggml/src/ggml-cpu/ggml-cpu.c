@@ -1742,6 +1742,675 @@ static int  ggml_cpu_moe_block_of(const struct ggml_tensor * w) {
     return blk;
 }
 
+
+// ============================================================================
+// Explicit expert arena (ALICE_ARENA=1)
+//
+// Bounded, arena-owned storage for the host-tier routed experts. The arena is a per-(layer,
+// projection) set of slots that hold copies of the RUNTIME expert slices, so what the GEMM reads
+// from the arena is by construction the same bytes it would read from src0->data - no offline
+// pack can be stale, wrong-typed, or requantised differently from what the model actually uses.
+//
+//     router ids -> per-projection LUT -> resident slot
+//                                    \-> miss: copy the slice out of the tensor into a slot,
+//                                        evicting the least recently used unit of that layer
+//
+// Residency is explicit: the arena is anonymous memory the runtime owns, so the kernel page cache
+// cannot reclaim it underneath the expert path. While a tensor is arena-backed mul_mat_id never
+// dereferences src0->data for expert slabs, and a missing slot is filled (counted) rather than
+// silently falling back.
+//
+// Config: ALICE_ARENA=1, ALICE_ARENA_BYTES=<budget>, ALICE_ARENA_DROP_PAGES=1 (madvise the copied
+// source range away so the page cache does not double-buffer the arena), ALICE_ARENA_STATS=0 to mute.
+// ============================================================================
+
+#define GGML_CPU_ARENA_MAX_LAYERS 64
+
+struct ggml_cpu_arena_ident {
+    char     magic[8];      // "AIDN0001"
+    int32_t  layer;
+    int32_t  proj;
+    int32_t  n_expert;
+    int32_t  type;
+    int64_t  ne0;
+    int64_t  ne1;
+    int64_t  nb1;
+    int64_t  slot_bytes;
+    uint64_t sample_hash[4];  // slices 0, 1, n/2, n-1 as seen by the runtime
+};
+
+struct ggml_cpu_arena_proj {
+    int       ready;
+    int       slots;
+    size_t    slot_bytes;       // bytes of one expert slice for this projection
+    char *    mem;              // slots * slot_bytes, anonymous
+    int32_t * slot_of;          // [n_expert] -> slot, or -1
+    int32_t * expert_of;        // [slots]    -> expert, or -1
+    uint64_t* used;             // [slots]    LRU stamp
+    uint64_t  hits, fills, evictions, bytes_copied, stall_ns, not_resident;
+    uint64_t* slot_gen;         // [slots]: generation of the fill that completed (-1 = none)
+    uint64_t* slot_gen_expect;  // [slots]: generation the current occupant must reach
+    int8_t *  slot_ready;       // [slots]: 0 filling, 1 ready, 2 failed (kept for the failure signal)
+    uint64_t  waited_ns;        // time compute threads spent waiting for their own expert
+    // runtime dump store: slices written once, read back with O_DIRECT on later fills/refills
+    int       n_expert;
+    char      dump_path[1024];
+    char      ident_path[1024];
+    int       dump_fd;
+    const void * tensor_data;   // src0->data of the tensor this projection mirrors
+    size_t    tensor_nb2;       // its expert stride
+    struct ggml_cpu_arena_ident ident;   // this tensor's identity (written into the sidecar)
+    int       dump_verified;    // the dump file matches this tensor's identity
+    int       dumped;           // experts written so far this process
+    int       dumped_dirty;     // new slices since the sidecar was last written
+    uint8_t * dumped_bit;       // [n_expert]: slice present in the dump file
+    uint64_t  dump_reads, dump_writes, dump_hits, dump_bytes_read;
+};
+
+struct ggml_cpu_arena_layer {
+    int       created;
+    int       layer;
+    struct ggml_cpu_arena_proj p[2];    // 0 = gate_up, 1 = down
+};
+
+static struct {
+    int       state;            // -1 unknown, 0 disabled, 1 enabled
+    size_t    budget;
+    int       drop_pages;
+    int       stats;
+    int       dump_fill;        // one-off populate of the whole store at first use
+    int       qd;               // fill queue depth
+    int       pool_started, pool_stop, pool_nw;
+    pthread_t pool[16];
+    pthread_mutex_t pool_m;
+    pthread_cond_t  pool_cv_job, pool_cv_done, pool_cv_ready;
+    // independent batch slots: a node claims one and never shares it with an in-flight node
+    struct {
+        struct { int li, proj, expert, slot; } job[512];
+        int      n, next, done;
+        uint64_t gen;
+        int      in_use;
+    } batches[4];
+    uint64_t  job_gen;
+    int       n_layer;
+    struct ggml_cpu_arena_layer layers[GGML_CPU_ARENA_MAX_LAYERS];
+    uint64_t  clock;
+    pthread_mutex_t lock;
+} g_arena = { .state = -1 };
+
+static void ggml_cpu_arena_dump(void);
+static void ggml_cpu_arena_dump_open(struct ggml_cpu_arena_proj * P, int layer, int proj, const struct ggml_tensor * w);
+static void ggml_cpu_arena_dump_finalize(struct ggml_cpu_arena_proj * P, int layer, int proj, const struct ggml_tensor * w);
+static void ggml_cpu_arena_ident_of(struct ggml_cpu_arena_ident * id, int layer, int proj,
+                                    const struct ggml_tensor * w, size_t slot_bytes);
+
+static size_t ggml_cpu_arena_parse_bytes(const char * s, size_t dflt) {
+    if (s == NULL || s[0] == '\0') return dflt;
+    char * end = NULL;
+    double v = strtod(s, &end);
+    if (end != NULL) {
+        if (*end == 'G' || *end == 'g') v *= 1024.0 * 1024.0 * 1024.0;
+        else if (*end == 'M' || *end == 'm') v *= 1024.0 * 1024.0;
+        else if (*end == 'K' || *end == 'k') v *= 1024.0;
+    }
+    return v > 0 ? (size_t) v : dflt;
+}
+
+static int ggml_cpu_arena_init(void) {
+    if (g_arena.state >= 0) return g_arena.state;
+    g_arena.state = 0;
+    const char * e = getenv("ALICE_ARENA");
+    if (e == NULL || e[0] == '\0' || strcmp(e, "0") == 0) return 0;
+    g_arena.budget = ggml_cpu_arena_parse_bytes(getenv("ALICE_ARENA_BYTES"), (size_t) 16 * 1024 * 1024 * 1024);
+    const char * dp = getenv("ALICE_ARENA_DROP_PAGES");
+    g_arena.drop_pages = (dp != NULL && strcmp(dp, "0") != 0);
+    const char * st = getenv("ALICE_ARENA_STATS");
+    g_arena.stats = (st == NULL || strcmp(st, "0") != 0);
+    const char * df = getenv("ALICE_ARENA_DUMP_FILL");
+    g_arena.dump_fill = (df != NULL && strcmp(df, "0") != 0);
+    const char * qd = getenv("ALICE_ARENA_QD");
+    g_arena.qd = qd ? atoi(qd) : 8;
+    if (g_arena.qd < 1) g_arena.qd = 1;
+    if (g_arena.qd > 16) g_arena.qd = 16;
+    pthread_mutex_init(&g_arena.pool_m, NULL);
+    pthread_cond_init(&g_arena.pool_cv_job, NULL);
+    pthread_cond_init(&g_arena.pool_cv_done, NULL);
+    pthread_cond_init(&g_arena.pool_cv_ready, NULL);
+    pthread_cond_init(&g_arena.pool_cv_ready, NULL);
+    pthread_mutex_init(&g_arena.lock, NULL);
+    g_arena.n_layer = GGML_CPU_ARENA_MAX_LAYERS;
+    g_arena.state = 1;
+    atexit(ggml_cpu_arena_dump);
+    GGML_LOG_WARN("%s: arena enabled budget=%.2f GiB drop_pages=%d qd=%d populate=%d "
+                  "(slots hold copies of RUNTIME expert slices)\n",
+                  __func__, g_arena.budget / 1073741824.0, g_arena.drop_pages, g_arena.qd, g_arena.dump_fill);
+    return 1;
+}
+
+// resolve tensor -> (layer, projection); returns the projection struct or NULL when not applicable
+static struct ggml_cpu_arena_proj * ggml_cpu_arena_proj_for(const struct ggml_tensor * w, int create) {
+    if (g_arena.state != 1 || w == NULL || w->data == NULL || strncmp(w->name, "blk.", 4) != 0) return NULL;
+    const int layer = atoi(w->name + 4);
+    int proj = -1;
+    if (strstr(w->name, "ffn_gate_up_exps") != NULL) proj = 0;
+    else if (strstr(w->name, "ffn_down_exps")  != NULL) proj = 1;
+    if (proj < 0 || layer < 0 || layer >= g_arena.n_layer) return NULL;
+
+    struct ggml_cpu_arena_layer * L = &g_arena.layers[layer];
+    struct ggml_cpu_arena_proj  * P = &L->p[proj];
+    if (P->ready || !create) return P->ready ? P : NULL;
+
+    pthread_mutex_lock(&g_arena.lock);
+    if (P->ready) { pthread_mutex_unlock(&g_arena.lock); return P; }
+    L->layer = layer;
+
+    const size_t slice = (size_t) w->nb[1] * (size_t) w->ne[1];   // exact bytes of one expert slice
+    const int n_expert = (int) w->ne[2];
+    if (slice == 0 || n_expert <= 0) { pthread_mutex_unlock(&g_arena.lock); return NULL; }
+
+    const size_t per_layer = g_arena.budget / GGML_CPU_ARENA_MAX_LAYERS;
+    int slots = (int) (per_layer / slice);
+    if (slots < 1) {
+        GGML_LOG_WARN("%s: layer %d proj %d: slice %zu B exceeds the per-layer budget %zu B; not arena-backed\n",
+                      __func__, layer, proj, slice, per_layer);
+        pthread_mutex_unlock(&g_arena.lock);
+        return NULL;
+    }
+    if (slots > n_expert) slots = n_expert;
+
+    void * m = mmap(NULL, (size_t) slots * slice, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    P->slot_of   = (int32_t *) malloc(sizeof(int32_t) * (size_t) n_expert);
+    P->expert_of = (int32_t *) malloc(sizeof(int32_t) * (size_t) slots);
+    P->used      = (uint64_t *) calloc((size_t) slots, sizeof(uint64_t));
+    P->slot_ready = (int8_t *) calloc((size_t) slots, sizeof(int8_t));
+    P->slot_gen = (uint64_t *) calloc((size_t) slots, sizeof(uint64_t));
+    P->slot_gen_expect = (uint64_t *) calloc((size_t) slots, sizeof(uint64_t));
+    if (m == MAP_FAILED || P->slot_of == NULL || P->expert_of == NULL || P->used == NULL || P->slot_ready == NULL) {
+        if (m != MAP_FAILED) munmap(m, (size_t) slots * slice);
+        free(P->slot_of); free(P->expert_of); free(P->used); free(P->slot_ready);
+        free(P->slot_gen); free(P->slot_gen_expect);
+        P->slot_of = NULL; P->expert_of = NULL; P->used = NULL; P->slot_ready = NULL;
+        P->slot_gen = NULL; P->slot_gen_expect = NULL;
+        GGML_LOG_ERROR("%s: layer %d proj %d: allocation failed; tensor stays mmap-backed\n", __func__, layer, proj);
+        pthread_mutex_unlock(&g_arena.lock);
+        return NULL;
+    }
+    P->mem = (char *) m;
+    P->slots = slots;
+    P->slot_bytes = slice;
+    for (int i = 0; i < n_expert; ++i) P->slot_of[i] = -1;
+    for (int i = 0; i < slots; ++i) P->expert_of[i] = -1;
+    P->n_expert = n_expert;
+    P->tensor_data = w->data;
+    P->tensor_nb2 = (size_t) w->nb[2];
+    P->dump_fd = -1;
+    ggml_cpu_arena_ident_of(&P->ident, layer, proj, w, slice);
+    (void) 0;
+    ggml_cpu_arena_dump_open(P, layer, proj, w);
+    if (g_arena.dump_fill && P->dump_fd >= 0) {
+        // one-off populate: copy every slice of this projection into the store
+        const size_t page = 4096;
+        int wrote = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            if (P->dumped_bit != NULL && P->dumped_bit[e]) continue;
+            const char * src = (const char *) w->data + (size_t) e * (size_t) w->nb[2];
+            if (((uintptr_t) src % page) != 0 || (slice % page) != 0) continue;   // O_DIRECT needs alignment
+            if (pwrite(P->dump_fd, src, slice, (off_t) ((size_t) e * slice)) == (ssize_t) slice) {
+                P->dumped_bit[e] = 1;
+                P->dumped++; P->dump_writes++; P->dumped_dirty++;
+                wrote++;
+            }
+            if (g_arena.drop_pages) {
+                madvise((char *) ((uintptr_t) src & ~(page - 1)), slice + page, MADV_DONTNEED);
+            }
+        }
+        ggml_cpu_arena_dump_finalize(P, layer, proj, w);
+        GGML_LOG_WARN("%s: layer %d proj %d: populated %d slices into %s\n",
+                      __func__, layer, proj, wrote, P->dump_path);
+    }
+    P->ready = 1;
+    L->created = 1;
+    pthread_mutex_unlock(&g_arena.lock);
+    GGML_LOG_WARN("%s: layer %d proj %s arena: %d slots x %zu B = %.1f MiB (of %d experts)\n",
+                  __func__, layer, proj == 0 ? "gate_up" : "down", slots, slice,
+                  (double) slots * (double) slice / 1048576.0, n_expert);
+    return P;
+}
+
+// 64-bit FNV-1a over a slice: enough to detect a stale or requantised dump
+static uint64_t ggml_cpu_arena_hash(const void * p, size_t n) {
+    const unsigned char * b = (const unsigned char *) p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static void ggml_cpu_arena_ident_of(struct ggml_cpu_arena_ident * id, int layer, int proj,
+                                    const struct ggml_tensor * w, size_t slot_bytes) {
+    memset(id, 0, sizeof(*id));
+    memcpy(id->magic, "AIDN0001", 8);
+    id->layer = layer; id->proj = proj;
+    id->n_expert = (int32_t) w->ne[2];
+    id->type = (int32_t) w->type;
+    id->ne0 = w->ne[0]; id->ne1 = w->ne[1]; id->nb1 = (int64_t) w->nb[1];
+    id->slot_bytes = (int64_t) slot_bytes;
+    const int n = (int) w->ne[2];
+    const int pick[4] = { 0, 1, n / 2, n - 1 };
+    for (int i = 0; i < 4; ++i) {
+        const int e = pick[i] >= 0 && pick[i] < n ? pick[i] : 0;
+        id->sample_hash[i] = ggml_cpu_arena_hash((const char *) w->data + (size_t) e * (size_t) w->nb[2], slot_bytes);
+    }
+}
+
+// open the dump store and trust it only when its identity sidecar matches this tensor exactly
+static void ggml_cpu_arena_dump_open(struct ggml_cpu_arena_proj * P, int layer, int proj, const struct ggml_tensor * w) {
+    const char * dir = getenv("ALICE_ARENA_DUMP");
+    if (dir == NULL || dir[0] == '\0') return;
+    snprintf(P->dump_path, sizeof(P->dump_path), "%s/layer_%02d_proj%d.slice", dir, layer, proj);
+    snprintf(P->ident_path, sizeof(P->ident_path), "%s/layer_%02d_proj%d.ident", dir, layer, proj);
+
+    struct ggml_cpu_arena_ident want;
+    ggml_cpu_arena_ident_of(&want, layer, proj, w, P->slot_bytes);
+
+    struct ggml_cpu_arena_ident have;
+    FILE * f = fopen(P->ident_path, "rb");
+    if (f != NULL) {
+        const size_t got = fread(&have, 1, sizeof(have), f);
+        if (got == sizeof(have) && memcmp(&have, &want, sizeof(want)) == 0) {
+            // per-slice completion bitmap follows the identity record
+            P->dumped_bit = (uint8_t *) calloc((size_t) P->n_expert, 1);
+            const size_t bm = fread(P->dumped_bit, 1, (size_t) P->n_expert, f);
+            P->dump_verified = 1;
+            int present = 0;
+            for (int i = 0; i < P->n_expert; ++i) present += P->dumped_bit[i] ? 1 : 0;
+            GGML_LOG_WARN("%s: layer %d proj %d: dump store accepted (%d/%d slices present) from %s\n",
+                          __func__, layer, proj, present, P->n_expert, P->dump_path);
+            if (bm != (size_t) P->n_expert) {
+                GGML_LOG_WARN("%s: layer %d proj %d: completion bitmap truncated; treating as empty\n",
+                              __func__, layer, proj);
+                memset(P->dumped_bit, 0, (size_t) P->n_expert);
+            }
+        } else if (got > 0) {
+            GGML_LOG_WARN("%s: layer %d proj %d: dump identity mismatch (%s) - the store belongs to a "
+                          "different tensor; rewriting it\n", __func__, layer, proj, P->ident_path);
+        }
+        fclose(f);
+    }
+    const int flags = O_RDWR | O_CREAT | O_DIRECT;
+    P->dump_fd = open(P->dump_path, flags, 0644);
+    if (P->dump_fd < 0) {
+        P->dump_fd = open(P->dump_path, O_RDWR | O_CREAT, 0644);
+        if (P->dump_fd < 0) {
+            GGML_LOG_WARN("%s: cannot open dump %s: %s\n", __func__, P->dump_path, strerror(errno));
+            return;
+        }
+    }
+    if (P->dumped_bit == NULL) {
+        P->dumped_bit = (uint8_t *) calloc((size_t) P->n_expert, 1);
+    }
+}
+
+// persist identity + per-slice bitmap so later processes can reuse what was already dumped
+static void ggml_cpu_arena_dump_finalize(struct ggml_cpu_arena_proj * P, int layer, int proj, const struct ggml_tensor * w) {
+    if (P->dump_fd < 0 || P->dumped_bit == NULL || P->dumped_dirty == 0) return;
+    (void) w; (void) layer; (void) proj;
+    FILE * f = fopen(P->ident_path, "wb");
+    if (f != NULL) {
+        fwrite(&P->ident, 1, sizeof(P->ident), f);
+        fwrite(P->dumped_bit, 1, (size_t) P->n_expert, f);
+        fclose(f);
+        P->dump_verified = 1;
+        P->dumped_dirty = 0;
+        int present = 0;
+        for (int i = 0; i < P->n_expert; ++i) present += P->dumped_bit[i] ? 1 : 0;
+        GGML_LOG_WARN("%s: layer %d proj %d: sidecar written (%d/%d slices)\n",
+                      __func__, layer, proj, present, P->n_expert);
+    }
+}
+
+static void ggml_cpu_arena_fill_job(int li, int proj, int expert, int slot, uint64_t gen) {
+    struct ggml_cpu_arena_layer * L = &g_arena.layers[li];
+    struct ggml_cpu_arena_proj  * P = &L->p[proj];
+    char * dst = P->mem + (size_t) slot * P->slot_bytes;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ssize_t got = -1;
+    if (P->dump_fd >= 0 && P->dumped_bit != NULL && P->dumped_bit[expert]) {
+        // the store already holds this slice (identity-verified at open): one O_DIRECT read
+        got = pread(P->dump_fd, dst, P->slot_bytes, (off_t) ((size_t) expert * P->slot_bytes));
+    }
+    int copied = 0;
+    if (got != (ssize_t) P->slot_bytes && P->tensor_data != NULL) {
+        const char * src = (const char *) P->tensor_data + (size_t) expert * P->tensor_nb2;
+        memcpy(dst, src, P->slot_bytes);
+        copied = 1;
+        if (P->dump_fd >= 0 && P->dumped_bit != NULL && !P->dumped_bit[expert]) {
+            const size_t page = 4096;
+            if (((uintptr_t) src % page) == 0 && (P->slot_bytes % page) == 0 &&
+                pwrite(P->dump_fd, src, P->slot_bytes, (off_t) ((size_t) expert * P->slot_bytes)) == (ssize_t) P->slot_bytes) {
+                P->dumped_bit[expert] = 1;
+                P->dumped++;
+                P->dump_writes++;
+                P->dumped_dirty++;
+            }
+            if (g_arena.drop_pages) {
+                madvise((char *) ((uintptr_t) src & ~(page - 1)), P->slot_bytes + page, MADV_DONTNEED);
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pthread_mutex_lock(&g_arena.pool_m);
+    P->stall_ns += (uint64_t) (t1.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t) (t1.tv_nsec - t0.tv_nsec);
+    if (got == (ssize_t) P->slot_bytes || copied) {
+        if (got == (ssize_t) P->slot_bytes) {
+            P->dump_reads++;
+            P->dump_bytes_read += (uint64_t) got;
+        }
+        P->fills++;
+        P->bytes_copied += P->slot_bytes;
+        if (P->slot_ready != NULL) P->slot_ready[slot] = 1;
+        if (P->slot_gen != NULL) P->slot_gen[slot] = gen;
+    } else {
+        P->slot_of[expert] = -1;
+        P->expert_of[slot]  = -1;
+        if (P->slot_ready != NULL) P->slot_ready[slot] = 2;
+    }
+    pthread_cond_broadcast(&g_arena.pool_cv_ready);
+    pthread_mutex_unlock(&g_arena.pool_m);
+}
+
+static void * ggml_cpu_arena_worker(void * arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&g_arena.pool_m);
+        int found = -1;
+        while (!g_arena.pool_stop) {
+            for (int b = 0; b < 4; ++b) {
+                if (g_arena.batches[b].in_use && g_arena.batches[b].next < g_arena.batches[b].n) { found = b; break; }
+            }
+            if (found >= 0) break;
+            pthread_cond_wait(&g_arena.pool_cv_job, &g_arena.pool_m);
+        }
+        if (g_arena.pool_stop) { pthread_mutex_unlock(&g_arena.pool_m); return NULL; }
+        const int i = g_arena.batches[found].next++;
+        const int li = g_arena.batches[found].job[i].li, pr = g_arena.batches[found].job[i].proj;
+        const int ex = g_arena.batches[found].job[i].expert, sl = g_arena.batches[found].job[i].slot;
+        const uint64_t gen = g_arena.batches[found].gen;
+        pthread_mutex_unlock(&g_arena.pool_m);
+        ggml_cpu_arena_fill_job(li, pr, ex, sl, gen);
+        pthread_mutex_lock(&g_arena.pool_m);
+        if (++g_arena.batches[found].done >= g_arena.batches[found].n) {
+            pthread_cond_broadcast(&g_arena.pool_cv_done);
+        }
+        pthread_mutex_unlock(&g_arena.pool_m);
+    }
+}
+
+// parse "8-15" / "4,6,8" into a cpu_set_t; returns 0 when the spec is absent or malformed
+static int ggml_cpu_arena_parse_cpus(const char * spec, cpu_set_t * set) {
+    if (spec == NULL || spec[0] == '\0') return 0;
+    CPU_ZERO(set);
+    const char * p = spec;
+    while (*p != '\0') {
+        char * end = NULL;
+        const long a = strtol(p, &end, 10);
+        if (end == p) return 0;
+        long b = a;
+        p = end;
+        if (*p == '-') { p++; b = strtol(p, &end, 10); if (end == p) return 0; p = end; }
+        if (a < 0 || b < a || b > 1023) return 0;
+        for (long i = a; i <= b; ++i) CPU_SET((int) i, set);
+        if (*p == ',') p++;
+        else if (*p != '\0') return 0;
+    }
+    return 1;
+}
+
+struct ggml_cpu_arena_worker_arg { int idx; cpu_set_t cpus; int pin; };
+
+static void * ggml_cpu_arena_worker_pinned(void * arg) {
+    struct ggml_cpu_arena_worker_arg * wa = (struct ggml_cpu_arena_worker_arg *) arg;
+    if (wa->pin) {
+#if defined(__gnu_linux__)
+        const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &wa->cpus);
+        if (rc != 0) {
+            GGML_LOG_WARN("%s: fill worker %d could not set affinity: %s\n", __func__, wa->idx, strerror(rc));
+        }
+#endif
+    }
+    return ggml_cpu_arena_worker(NULL);
+}
+
+static void ggml_cpu_arena_pool_start(void) {
+    if (g_arena.pool_started || g_arena.qd <= 1) return;
+    g_arena.pool_nw = 0;
+    cpu_set_t fill_cpus;
+    const int pin = ggml_cpu_arena_parse_cpus(getenv("ALICE_ARENA_FILL_CPUS"), &fill_cpus);
+    if (pin) {
+        GGML_LOG_WARN("%s: fill workers pinned to ALICE_ARENA_FILL_CPUS=%s (compute keeps its own cores)\n",
+                      __func__, getenv("ALICE_ARENA_FILL_CPUS"));
+    }
+    for (int i = 0; i < g_arena.qd; ++i) {
+        static struct ggml_cpu_arena_worker_arg wa[16];
+        wa[i].idx = i;
+        wa[i].pin = pin;
+        if (pin) wa[i].cpus = fill_cpus;
+        if (pthread_create(&g_arena.pool[i], NULL, ggml_cpu_arena_worker_pinned, &wa[i]) != 0) break;
+        g_arena.pool_nw++;
+    }
+    g_arena.pool_started = 1;
+    GGML_LOG_WARN("%s: fill pool with %d worker(s), store reads at queue depth\n", __func__, g_arena.pool_nw);
+}
+
+static int ggml_cpu_arena_slot_for(struct ggml_cpu_arena_proj * P, int expert) {
+    for (int i = 0; i < P->slots; ++i) {
+        if (P->expert_of[i] < 0) {
+            P->expert_of[i] = expert;
+            P->used[i] = ++g_arena.clock;
+            return i;
+        }
+    }
+    int victim = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < P->slots; ++i) {
+        if (P->used[i] < oldest) { oldest = P->used[i]; victim = i; }
+    }
+    const int old = P->expert_of[victim];
+    if (old >= 0) P->slot_of[old] = -1;
+    P->evictions++;
+    P->expert_of[victim] = expert;
+    P->used[victim] = ++g_arena.clock;
+    return victim;
+}
+
+// make every expert this node routes resident; 1 when the tensor is arena-backed
+static int ggml_cpu_arena_ensure(const struct ggml_tensor * src0, const struct ggml_tensor * ids) {
+    if (ggml_cpu_arena_init() != 1) return 0;
+    struct ggml_cpu_arena_proj * P = ggml_cpu_arena_proj_for(src0, 1);
+    if (P == NULL) return 0;
+
+    const int64_t n_ids  = ids->ne[0];
+    const int64_t n_rows = ids->ne[1];
+    const int li = atoi(src0->name + 4);
+    const int pr = strstr(src0->name, "ffn_down_exps") ? 1 : 0;
+    const int cap = (int) (sizeof(g_arena.batches[0].job) / sizeof(g_arena.batches[0].job[0]));
+
+    pthread_mutex_lock(&g_arena.pool_m);
+    int bsel = -1;
+    for (int b = 0; b < 4; ++b) {
+        if (!g_arena.batches[b].in_use) { bsel = b; break; }
+    }
+    if (bsel < 0) {
+        // every batch slot is in flight: reap the oldest before claiming a new one
+        for (int b = 0; b < 4; ++b) {
+            if (g_arena.batches[b].done >= g_arena.batches[b].n) g_arena.batches[b].in_use = 0;
+        }
+        for (int b = 0; b < 4; ++b) {
+            if (!g_arena.batches[b].in_use) { bsel = b; break; }
+        }
+    }
+    if (bsel < 0) {
+        while (g_arena.batches[0].done < g_arena.batches[0].n) {
+            pthread_cond_wait(&g_arena.pool_cv_done, &g_arena.pool_m);
+        }
+        g_arena.batches[0].in_use = 0;
+        bsel = 0;
+    }
+    g_arena.batches[bsel].n = 0;
+    g_arena.batches[bsel].next = 0;
+    g_arena.batches[bsel].done = 0;
+    g_arena.batches[bsel].gen = ++g_arena.job_gen;
+    g_arena.batches[bsel].in_use = 1;
+
+    for (int64_t r = 0; r < n_rows; ++r) {
+        for (int64_t k = 0; k < n_ids; ++k) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + r * ids->nb[1] + k * ids->nb[0]);
+            if (e < 0 || e >= src0->ne[2]) continue;
+            const int32_t slot = P->slot_of[e];
+            if (slot >= 0) {
+                P->hits++;
+                P->used[slot] = ++g_arena.clock;
+                continue;
+            }
+            int dup = 0;
+            for (int i = 0; i < g_arena.batches[bsel].n; ++i) {
+                if (g_arena.batches[bsel].job[i].expert == e) { dup = 1; break; }
+            }
+            if (dup) continue;
+            const int new_slot = ggml_cpu_arena_slot_for(P, (int) e);
+            P->slot_of[e] = new_slot;
+            if (P->slot_ready != NULL) P->slot_ready[new_slot] = 0;   // filling
+            if (g_arena.batches[bsel].n < cap) {
+                const int jn = g_arena.batches[bsel].n;
+                g_arena.batches[bsel].job[jn].li     = li;
+                g_arena.batches[bsel].job[jn].proj   = pr;
+                g_arena.batches[bsel].job[jn].expert = (int) e;
+                g_arena.batches[bsel].job[jn].slot   = new_slot;
+                g_arena.batches[bsel].n++;
+            }
+            if (P->slot_gen_expect != NULL) P->slot_gen_expect[new_slot] = g_arena.batches[bsel].gen;
+        }
+    }
+
+    if (g_arena.batches[bsel].n > 0) {
+        if (g_arena.qd > 1) ggml_cpu_arena_pool_start();
+        if (g_arena.pool_nw > 0) {
+            // SHIPPED SEMANTICS: wait for this node's fills to complete before its compute threads run.
+            // Two pipelining designs (shared batch array, then per-node batch slots with generation-tagged
+            // readiness) were both measured NON-DETERMINISTIC by the destructive harness at QD=8
+            // (max|run1-run2| = 1.5-4.6 while max|ref| stayed 0; QD=1 was exactly 0 both times). The
+            // concurrent fill path is therefore left synchronous, which is exact and deterministic.
+            pthread_cond_broadcast(&g_arena.pool_cv_job);
+            while (g_arena.batches[bsel].done < g_arena.batches[bsel].n) {
+                pthread_cond_wait(&g_arena.pool_cv_done, &g_arena.pool_m);
+            }
+            g_arena.batches[bsel].in_use = 0;
+        } else {
+            for (int i = 0; i < g_arena.batches[bsel].n; ++i) {
+                const int jli = g_arena.batches[bsel].job[i].li, jpr = g_arena.batches[bsel].job[i].proj;
+                const int jex = g_arena.batches[bsel].job[i].expert, jsl = g_arena.batches[bsel].job[i].slot;
+                const uint64_t jgen = g_arena.batches[bsel].gen;
+                pthread_mutex_unlock(&g_arena.pool_m);
+                ggml_cpu_arena_fill_job(jli, jpr, jex, jsl, jgen);
+                pthread_mutex_lock(&g_arena.pool_m);
+            }
+            g_arena.batches[bsel].done = g_arena.batches[bsel].n;
+            g_arena.batches[bsel].in_use = 0;
+        }
+    } else {
+        g_arena.batches[bsel].in_use = 0;
+    }
+
+    if (P->dump_fd >= 0) {
+        ggml_cpu_arena_dump_finalize(P, li, pr, src0);
+    }
+    pthread_mutex_unlock(&g_arena.pool_m);
+    return 1;
+}
+
+// redirect one expert slab to its arena slot; NULL when this tensor is not arena-backed
+static const char * ggml_cpu_arena_slab(const struct ggml_tensor * w, int64_t expert, size_t nb02) {
+    (void) nb02;
+    if (g_arena.state != 1) return NULL;   // init happens in ensure() earlier in the same node
+    struct ggml_cpu_arena_proj * P = ggml_cpu_arena_proj_for(w, 0);
+    if (P == NULL) return NULL;
+    if (expert < 0 || expert >= w->ne[2]) return NULL;
+    const int32_t slot = P->slot_of[expert];
+    if (slot < 0) {
+        pthread_mutex_lock(&g_arena.lock);
+        P->not_resident++;
+        pthread_mutex_unlock(&g_arena.lock);
+        return NULL;
+    }
+    return P->mem + (size_t) slot * P->slot_bytes;
+}
+
+static void ggml_cpu_arena_dump(void) {
+    if (g_arena.state != 1) return;
+    // persist any dump progress even on an early exit
+    for (int i = 0; i < g_arena.n_layer; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            struct ggml_cpu_arena_proj * P = &g_arena.layers[i].p[j];
+            if (P->ready && P->dump_fd >= 0 && P->dumped_dirty) {
+                struct ggml_tensor fake = { 0 };
+                (void) fake;
+                // identity fields come from the stored values instead of the tensor at exit
+                FILE * f = fopen(P->ident_path, "wb");
+                if (f != NULL) {
+                    fwrite(&P->ident, 1, sizeof(P->ident), f);
+                    fwrite(P->dumped_bit, 1, (size_t) P->n_expert, f);
+                    fclose(f);
+                }
+            }
+        }
+    }
+    if (!g_arena.stats) return;
+    uint64_t hits = 0, fills = 0, evict = 0, bytes = 0, stall = 0, notres = 0;
+    uint64_t dump_r = 0, dump_w = 0, dump_b = 0, waited = 0;
+    size_t alloc = 0;
+    int created = 0;
+    for (int i = 0; i < g_arena.n_layer; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            struct ggml_cpu_arena_proj * P = &g_arena.layers[i].p[j];
+            if (!P->ready) continue;
+            created++;
+            alloc += (size_t) P->slots * P->slot_bytes;
+            hits += P->hits; fills += P->fills; evict += P->evictions;
+            bytes += P->bytes_copied; stall += P->stall_ns; notres += P->not_resident;
+            waited += P->waited_ns;
+            waited += P->waited_ns;
+            dump_r += P->dump_reads; dump_w += P->dump_writes; dump_b += P->dump_bytes_read;
+        }
+    }
+    const double total = (double) (hits + fills);
+    fprintf(stderr, "[arena] projections=%d arena=%.2f GiB hits=%" PRIu64 " fills=%" PRIu64 " (%.3f%% hit) "
+                    "evictions=%" PRIu64 " bytes_copied=%.2f GB stall=%.1f ms not_resident=%" PRIu64 " drop_pages=%d\n",
+            created, alloc / 1073741824.0, hits, fills,
+            total > 0 ? 100.0 * (double) hits / total : 0.0,
+            evict, bytes / 1e9, stall / 1e6, notres, g_arena.drop_pages);
+    fprintf(stderr, "[arena] compute-thread wait for own expert: %.1f ms (overlapped fills: %.1f ms of "
+                    "fill work submitted asynchronously)\n", waited / 1e6, stall / 1e6);
+    fprintf(stderr, "[arena] compute-thread wait for own expert: %.1f ms (overlapped fills: %.1f ms of "
+                    "fill work submitted asynchronously)\n", waited / 1e6, stall / 1e6);
+    if (dump_r || dump_w) {
+        fprintf(stderr, "[arena] dump store: reads=%" PRIu64 " (%.2f GB via O_DIRECT) writes=%" PRIu64 "\n",
+                dump_r, dump_b / 1e9, dump_w);
+    }
+    fflush(stderr);
+}
+
+// true when this tensor is one the arena would own (name matches and the arena is on); used to keep
+// the IQP panel path away from arena-backed experts, independent of whether the first fill has run
+static int ggml_cpu_arena_applies(const struct ggml_tensor * w) {
+    if (ggml_cpu_arena_init() != 1) return 0;
+    if (w == NULL || w->data == NULL || strncmp(w->name, "blk.", 4) != 0) return 0;
+    return strstr(w->name, "ffn_gate_up_exps") != NULL || strstr(w->name, "ffn_down_exps") != NULL;
+}
+
+static int ggml_cpu_arena_on_maybe(const struct ggml_tensor * w) {
+    return ggml_cpu_arena_applies(w);
+}
+
 static int ggml_cpu_moe_resident_in_set(int block, int expert) {
     if (g_resident_set_state < 0) {
         g_resident_set_state = 0;
@@ -2032,7 +2701,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
     // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
-    const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
+    // The arena keeps the panel GEMM disabled for its tensors: a same-binary A/B (ALICE_PANEL_AB.json)
+    // measured the panel as a net negative WITH the arena (decode -3.8%, prefill -42%), and the panel
+    // needs >= 8 rows on one expert, which real routing rarely delivers.
+    const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref && !ggml_cpu_arena_on_maybe(dst->src[0]);
 
     char * iqp_panels = NULL;
 
@@ -2095,11 +2767,17 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
-        // BASE lane: put the routed expert slabs in flight before the first
-        // compute thread touches them (page-cache hint; no effect on values)
-        const int moe_prefetch = ggml_cpu_moe_prefetch_mode();
-        if (moe_prefetch > 0) {
-            ggml_cpu_moe_prefetch_experts(src0, ids, moe_prefetch);
+        // Explicit arena (ALICE_ARENA=1): make every routed expert resident BEFORE the compute
+        // threads run. While a tensor is arena-backed the mmap prefetch is skipped, because the
+        // point of the arena is that the expert storage is not the page cache.
+        const int arena_here = ggml_cpu_arena_ensure(src0, ids);
+        if (!arena_here) {
+            // BASE lane: put the routed expert slabs in flight before the first
+            // compute thread touches them (page-cache hint; no effect on values)
+            const int moe_prefetch = ggml_cpu_moe_prefetch_mode();
+            if (moe_prefetch > 0) {
+                ggml_cpu_moe_prefetch_experts(src0, ids, moe_prefetch);
+            }
         }
     }
 
@@ -2126,6 +2804,12 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        {
+            const char * a = ggml_cpu_arena_slab(src0, cur_a, nb02);
+            if (a != NULL) {
+                src0_cur = a;
+            }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
