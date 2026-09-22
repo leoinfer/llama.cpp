@@ -13,6 +13,8 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include "alice-mcensus.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1389,6 +1391,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool mc_on = ALICE_MC_ON();
+    const uint64_t mc_ub_t0 = mc_on ? alice_mc_now_ns() : 0;
+    uint64_t mc_build = 0, mc_alloc = 0, mc_setin = 0, mc_compute = 0;
+    int mc_reused = 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1413,6 +1420,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        mc_reused = 1;
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1422,7 +1430,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        {
+            alice_mc_timer mc_t(&mc_build);
+            gf = model.build_graph(gparams);
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1432,10 +1443,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+        {
+            alice_mc_timer mc_t(&mc_alloc);
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
         }
 
         gf_res_prev_active = res;
@@ -1445,13 +1459,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        alice_mc_timer mc_t(&mc_setin);
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    enum ggml_status status;
+    {
+        alice_mc_timer mc_t(&mc_compute);
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    }
+    if (mc_on) {
+        ALICE_MC_EV("UB %llu %llu %llu %llu %llu %d %d %d",
+                (unsigned long long) (alice_mc_now_ns() - mc_ub_t0), (unsigned long long) mc_build,
+                (unsigned long long) mc_alloc, (unsigned long long) mc_setin,
+                (unsigned long long) mc_compute, (int) ubatch.n_tokens, mc_reused, (int) gtype);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1711,6 +1736,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
+    const bool mc_on = ALICE_MC_ON();
+    const uint64_t mc_dc_t0 = mc_on ? alice_mc_now_ns() : 0;
+    uint64_t mc_memupd = 0, mc_outres = 0;
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1802,7 +1831,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    {
+        alice_mc_timer mc_t(&mc_memupd);
+        memory_update(false);
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -1850,10 +1882,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
-        return -2;
-    };
+    {
+        alice_mc_timer mc_t(&mc_outres);
+        if (output_reserve(n_outputs_all) < n_outputs_all) {
+            LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+            return -2;
+        }
+    }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -2092,6 +2127,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (mc_on) {
+        ALICE_MC_EV("DEC %llu %llu %llu %d %d",
+                (unsigned long long) (alice_mc_now_ns() - mc_dc_t0), (unsigned long long) mc_memupd,
+                (unsigned long long) mc_outres, (int) n_tokens_all, (int) n_outputs_all);
+    }
 
     return 0;
 }

@@ -1,5 +1,9 @@
 #include "ggml-vulkan-common.h"
 
+// lane/copy-census: exported counters so the scheduler can attribute submits/waits per copy.
+GGML_API uint64_t alice_mc_vk_submit = 0;
+GGML_API uint64_t alice_mc_vk_wait   = 0;
+
 namespace {
 inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
     return os << static_cast<VkBuffer>(buffer);
@@ -319,6 +323,7 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
 }
 
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    if (alice_mc_enabled) { alice_mc_vk_wait++; }
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
@@ -872,6 +877,7 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 }
 
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+    if (alice_mc_enabled) { alice_mc_vk_submit++; }
     if (ctx->seqs.empty()) {
         if (fence) {
             ctx->p->q->handle->submit({}, fence);
@@ -12872,6 +12878,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     }
 
     if (dst->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend_dst)) {
+        alice_mc_note(AMC_REJ_DST_NOT_VK);
         return false;
     }
 
@@ -12898,12 +12905,15 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         vk_buffer pinned_buf = nullptr;
         size_t pinned_offset = 0;
         ggml_vk_host_get(ctx->device, src->data, pinned_buf, pinned_offset);
+        if (alice_mc_enabled) { alice_mc_slot.pinned = 0; }
         if (pinned_buf == nullptr) {
+            alice_mc_note(AMC_REJ_SRC_NOT_PINNED);
             return false;
         }
 
         // If the backend is idle, use a CPU copy to avoid GPU synchronization overhead.
-        static constexpr size_t max_cpu_copy_size = 128 * 1024;
+        // lane/copy-census: this is only a win for small payloads -- see alice_vk_cpu_copy_max().
+        const size_t max_cpu_copy_size = alice_vk_cpu_copy_max(0); // deferred: no wait, DMA wins at any size
         const bool src_backend_synchronous = backend_src->iface.synchronize == nullptr;
         const bool transfer_idle = !ctx->device->async_use_transfer_queue ||
                                    ctx->transfer_semaphore_last_submitted == ctx->transfer_semaphore.value;
@@ -12913,11 +12923,23 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             (dst_buf->memory_property_flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) ==
             (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
 
+        if (alice_mc_enabled) {
+            alice_mc_slot.size_ok  = ggml_nbytes(src) <= max_cpu_copy_size;
+            alice_mc_slot.pinned   = 1; // ggml_vk_host_get() found a pinned VK host allocation
+            alice_mc_slot.coherent = dst_host_coherent;
+            alice_mc_slot.idle     = backend_idle;
+            if (!dst_host_coherent) { alice_mc_note(AMC_REJ_DST_NOT_COHERENT); }
+            if (!backend_idle)      { alice_mc_note(AMC_REJ_NOT_IDLE); }
+            if (ggml_nbytes(src) > max_cpu_copy_size) { alice_mc_note(AMC_REJ_SIZE); }
+        }
+
         if ((backend_src == backend_dst || src_backend_synchronous) && backend_idle && dst_host_coherent && ggml_nbytes(src) <= max_cpu_copy_size) {
+            alice_mc_note(AMC_ACCEPT_FASTPATH);
             ggml_vk_buffer_write(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src->data, ggml_nbytes(src));
             return true;
         }
 
+        alice_mc_note(AMC_ACCEPT_VKASYNC);
         vk_context cpy_ctx;
         if (ctx->device->async_use_transfer_queue) {
             cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
@@ -12930,6 +12952,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
                                           src->data, ggml_nbytes(src));
     }
 
+    alice_mc_note(AMC_REJ_SRC_NOT_HOST);
     return false;
 }
 
@@ -12958,6 +12981,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(compute_ctx, ctx->fence);
+            AMC_VK_WAIT();
             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
             ctx->device->device.resetFences({ ctx->fence });
         } else {
@@ -12981,9 +13005,11 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
                 0, nullptr,
             };
             si.setPNext(&tl_info);
+            if (alice_mc_enabled) { alice_mc_vk_submit++; }
             ctx->device->compute_queue->handle->submit({ si }, ctx->fence);
             ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
         } else {
+            if (alice_mc_enabled) { alice_mc_vk_submit++; }
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
         if (!ctx->device->serialize_submissions) {
@@ -13842,6 +13868,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
             try {
+                AMC_VK_WAIT();
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
                 if (res != vk::Result::eSuccess) {
                     GGML_LOG_ERROR("ggml_vulkan: waitForFences error during serialized submission\n");
