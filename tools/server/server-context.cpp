@@ -12,6 +12,8 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+
+#include "alice-mcensus.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -2374,6 +2376,17 @@ private:
 
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
+        // lane/master-census: RAII so every return path (including the decline path) is logged
+        struct mc_task_guard {
+            uint64_t t0;
+            int      type;
+            mc_task_guard(uint64_t t, int ty) : t0(t), type(ty) {}
+            ~mc_task_guard() {
+                if (alice_mc_enabled) {
+                    ALICE_MC_EV("PT %llu %d", (unsigned long long) (alice_mc_now_ns() - t0), type);
+                }
+            }
+        } mc_guard(alice_mc_enabled ? alice_mc_now_ns() : 0, (int) task.type);
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
@@ -2785,13 +2798,32 @@ private:
         }
     };
 #else
+    // lane/master-census: the same timers, enabled by the census env var instead of the
+    // DEBUG_TIMINGS macro (which also adds a llama_synchronize that would change the
+    // async behaviour being measured)
     struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
+        int64_t & t;
+        int64_t & n;
+        int64_t t_start;
+        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
+            t_start = alice_mc_enabled ? ggml_time_us() : 0;
+        }
+        ~scoped_timer() {
+            if (alice_mc_enabled) {
+                t += ggml_time_us() - t_start;
+                n++;
+            }
+        }
     };
 #endif
 
     void update_slots() {
+        const uint64_t mc_us_t0 = alice_mc_enabled ? alice_mc_now_ns() : 0;
+        const int64_t mc_pre0   = t_pre_decode;
+        const int64_t mc_dec0   = t_decode;
+        const int64_t mc_post0  = t_post_decode;
+        const int64_t mc_smp0   = t_sampl;
+        const int64_t mc_nd0    = n_decode;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2904,6 +2936,17 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+        }
+
+        if (alice_mc_enabled) {
+            ALICE_MC_EV("US %llu %llu %llu %llu %llu %llu %llu",
+                    (unsigned long long) (alice_mc_now_ns() - mc_us_t0),
+                    (unsigned long long) (t_pre_decode  - mc_pre0),
+                    (unsigned long long) (t_decode      - mc_dec0),
+                    (unsigned long long) (t_post_decode - mc_post0),
+                    (unsigned long long) (t_sampl       - mc_smp0),
+                    (unsigned long long) (n_decode      - mc_nd0),
+                    (unsigned long long) batch.size());
         }
     }
 

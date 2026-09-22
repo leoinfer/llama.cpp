@@ -430,6 +430,7 @@ bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t off
 
     if (buf != nullptr) {
         // Memory is pinned, use as staging buffer
+        alice_mc_note(AMC_PATH_PINNED_STAGE);
         std::vector<vk::BufferCopy> slices(1);
         if (width == spitch && width == dpitch) {
             // Only do single write if stride is equal
@@ -457,6 +458,7 @@ bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t off
     }
 
     // Staging buffer required
+    alice_mc_note(AMC_PATH_STAGE_SUBMIT);
     const size_t staging_size = width * height;
     ggml_vk_ensure_sync_staging_buffer(dst->device, staging_size);
 
@@ -496,9 +498,18 @@ bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t offset
 
 void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
-    // Buffer is already mapped
-    if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+    if (alice_mc_enabled) {
+        alice_mc_slot.coherent = (dst->memory_property_flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) ==
+                                 (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    // Buffer is already mapped. lane/copy-census: CPU stores into the host-visible mapping
+    // measured at ~0.25-0.33 GB/s, while a staging copyBuffer on the transfer queue runs at
+    // 5-22 GB/s plus one ~70 us submit+fence round trip -- so only the small payloads belong
+    // on the direct mapping (see alice_vk_cpu_copy_max()).
+    if ((dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+        width * height <= alice_vk_cpu_copy_max(16 * 1024)) {
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        alice_mc_note(AMC_PATH_HOST_MEMCPY);
 
         if (width == spitch && width == dpitch) {
             memcpy((uint8_t *)dst->ptr + offset, src, width * height);
@@ -510,6 +521,7 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
     } else {
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
 
+        alice_mc_note(AMC_PATH_TEMPCTX_SUBMIT);
         vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue->cmd_pool);
         ggml_vk_ctx_begin(dst->device, subctx);
         bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, spitch, dpitch, width, height, true);
@@ -526,6 +538,7 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
 
         ggml_vk_submit(subctx, dst->device->fence);
         VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_buffer_write_2d waitForFences", dst->device);
+        AMC_VK_WAIT();
         dst->device->device.resetFences({ dst->device->fence });
         ggml_vk_queue_command_pools_cleanup(dst->device);
     }
@@ -566,6 +579,7 @@ bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offs
 
     if (buf != nullptr) {
         // Memory is pinned, use as staging buffer
+        alice_mc_note(AMC_PATH_PINNED_STAGE);
         ggml_vk_sync_buffers(nullptr, subctx);
         subctx->s->buffer->buf.copyBuffer(src->buffer, buf->buffer, slices);
 
@@ -579,6 +593,7 @@ bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offs
     }
 
     // Fall back to staging buffer
+    alice_mc_note(AMC_PATH_STAGE_SUBMIT);
     const size_t staging_size = width * height;
     ggml_vk_ensure_sync_staging_buffer(src->device, staging_size);
 
@@ -617,6 +632,10 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 
 void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
+    if (alice_mc_enabled) {
+        alice_mc_slot.coherent = (src->memory_property_flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) ==
+                                 (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
 
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
@@ -624,6 +643,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
     if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
+        alice_mc_note(AMC_PATH_UMA_MEMCPY);
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         vk_context subctx = ggml_vk_create_temporary_context(src->device->compute_queue->cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
@@ -638,6 +658,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
         ggml_vk_submit(subctx, src->device->fence);
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX),
                  "vk_buffer_read_2d uma waitForFences", src->device);
+        AMC_VK_WAIT();
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
 
@@ -651,6 +672,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
     } else {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
 
+        alice_mc_note(AMC_PATH_TEMPCTX_SUBMIT);
         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue->cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
         bool ret = ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, spitch, dpitch, width, height, true);
@@ -659,6 +681,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
 
         ggml_vk_submit(subctx, src->device->fence);
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_read_2d waitForFences", src->device);
+        AMC_VK_WAIT();
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
 
@@ -688,12 +711,14 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         VK_LOG_DEBUG("ggml_vk_buffer_copy(SINGLE_DEVICE, " << size << ")");
         // Copy within the device
+        alice_mc_note(AMC_PATH_TEMPCTX_SUBMIT);
         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue->cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
         ggml_vk_buffer_copy_async(subctx, dst, dst_offset, src, src_offset, size);
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, src->device->fence);
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_copy waitForFences", src->device);
+        AMC_VK_WAIT();
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {

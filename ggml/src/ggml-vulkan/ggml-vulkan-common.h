@@ -1,5 +1,29 @@
 #pragma once
 #include "ggml-vulkan-push-constants.h"
+#include "alice-mcensus.h"
+
+#include <stdlib.h>
+
+// lane/copy-census: payload size above which a host->device copy must not be done with CPU
+// stores into the host-visible mapping. Measured on this part (RX 9060 XT / RADV):
+//   CPU stores into host-visible device/GTT memory  ->  0.24-0.33 GB/s  (330 us for 80 KiB)
+//   staging/copyBuffer on the transfer queue        ->  5.4-22.7 GB/s   (30 us for 160 KiB)
+//   a blocking submit+fence round trip              ->  ~70 us
+// 128 KiB is the upstream value and is ~4x past the crossover.
+//
+// Two thresholds, because the two call sites have different costs:
+//   - ggml_backend_vk_cpy_tensor_async defers the transfer into the copy context and does not
+//     wait, so the DMA path is free at any size: default 0 (always defer).
+//   - ggml_vk_buffer_write_2d's staging path blocks on a fence, so small payloads stay on the
+//     direct mapping: default 16 KiB.
+// ALICE_VK_CPU_COPY_MAX overrides both (A/B knob).
+static inline size_t alice_vk_cpu_copy_max(size_t def) {
+    static const size_t v = [] {
+        const char * e = getenv("ALICE_VK_CPU_COPY_MAX");
+        return e != nullptr ? (size_t) strtoull(e, nullptr, 0) : (size_t) -1;
+    }();
+    return v == (size_t) -1 ? def : v;
+}
 
 // shared globals
 extern ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface;

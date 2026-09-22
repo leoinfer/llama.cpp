@@ -23,10 +23,77 @@
 #include <unordered_map>
 #include <vector>
 
+#include <time.h>
+#include <unistd.h>
+
+#include "alice-mcensus.h"
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+
+// ALICE master census (lane/master-census) -- see ggml/include/alice-mcensus.h.
+// Lives in ggml-base so llama-context.cpp and the server can call it without a new target.
+GGML_API int alice_mc_enabled = 0;
+static FILE *   g_mc_log = NULL;
+static uint64_t g_mc_t0  = 0;
+
+// cross-backend copy census slot, shared with the Vulkan library (see alice-mcensus.h)
+struct alice_mc_slot alice_mc_slot;
+
+GGML_API uint64_t alice_mc_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+GGML_API void alice_mc_ev(const char * fmt, ...) {
+    if (g_mc_log == NULL) {
+        return;
+    }
+    fprintf(g_mc_log, "%llu ", (unsigned long long) (alice_mc_now_ns() - g_mc_t0));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_mc_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_mc_log);
+    fflush(g_mc_log);
+}
+
+static void alice_mc_exit(void) {
+    if (g_mc_log != NULL) {
+        fflush(g_mc_log);
+        fclose(g_mc_log);
+        g_mc_log = NULL;
+    }
+}
+
+__attribute__((constructor)) static void alice_mc_init(void) {
+    const char * e = getenv("ALICE_MC");
+    if (e == NULL || e[0] == '0') {
+        return;
+    }
+    char buf[512];
+    const char * path = getenv("ALICE_MC_LOG");
+    if (path == NULL) {
+        snprintf(buf, sizeof(buf), "/tmp/alice_mc_%d.log", (int) getpid());
+        path = buf;
+    }
+    g_mc_log = fopen(path, "w");
+    if (g_mc_log == NULL) {
+        return;
+    }
+    setvbuf(g_mc_log, NULL, _IOFBF, 1 << 20);
+    g_mc_t0 = alice_mc_now_ns();
+    struct timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    alice_mc_enabled = 1;
+    atexit(alice_mc_exit);
+    alice_mc_ev("H realtime_ns=%llu pid=%d",
+            (unsigned long long) rt.tv_sec * 1000000000ull + (unsigned long long) rt.tv_nsec, (int) getpid());
+}
 
 
 // backend buffer type
@@ -1643,6 +1710,127 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// ---- cross-backend copy census (lane/copy-census) ------------------------------------------
+// One CP event per input copy performed by the split loop. The Vulkan library OR-s in the
+// path bits / predicate inputs through alice_mc_note() while the copy runs.
+static void alice_mc_copy_begin(const struct ggml_tensor * input, const struct ggml_tensor * input_cpy,
+                                int split_id, int be_src, int be_dst) {
+    struct alice_mc_slot & s = alice_mc_slot;
+    memset(&s, 0, sizeof(s));
+    s.t0 = alice_mc_now_ns();
+    s.sub0 = alice_mc_vk_submit;
+    s.wait0 = alice_mc_vk_wait;
+    s.bytes = ggml_nbytes(input);
+    s.dir = ggml_backend_buffer_is_host(input->buffer) ? 1 :
+            (ggml_backend_buffer_is_host(input_cpy->buffer) ? 2 : 0);
+    s.split_id = split_id;
+    s.be_src = be_src;
+    s.be_dst = be_dst;
+    s.pinned = s.coherent = s.idle = s.size_ok = -1; // -1 = not evaluated
+    snprintf(s.src, sizeof(s.src), "%s", input->name);
+    snprintf(s.dst, sizeof(s.dst), "%s", input_cpy->name);
+}
+
+static void alice_mc_copy_end(void) {
+    struct alice_mc_slot & s = alice_mc_slot;
+    s.t1 = alice_mc_now_ns();
+    s.sub  = alice_mc_vk_submit - s.sub0;
+    s.wait = alice_mc_vk_wait  - s.wait0;
+    alice_mc_ev("CP split=%d be_src=%d be_dst=%d dir=%d bytes=%llu dur=%llu presync=%llu sub=%llu wait=%llu paths=0x%x size_ok=%d pinned=%d coh=%d idle=%d src=%s dst=%s",
+            s.split_id, s.be_src, s.be_dst, s.dir, (unsigned long long) s.bytes,
+            (unsigned long long) (s.t1 - s.t0), (unsigned long long) s.presync,
+            (unsigned long long) s.sub, (unsigned long long) s.wait,
+            (unsigned) s.paths, s.size_ok, s.pinned, s.coherent, s.idle, s.src, s.dst);
+}
+
+struct alice_mc_copy_guard {
+    bool on;
+    explicit alice_mc_copy_guard(bool o) : on(o) {}
+    ~alice_mc_copy_guard() { if (on) { alice_mc_copy_end(); } }
+    alice_mc_copy_guard(const alice_mc_copy_guard &) = delete;
+    alice_mc_copy_guard & operator=(const alice_mc_copy_guard &) = delete;
+};
+
+// stamp the ns spent in synchronise()/event_synchronize() before the copy itself
+#define AMC_PRE() do { if (mc_on) { alice_mc_slot.presync = alice_mc_now_ns() - alice_mc_slot.t0; } } while (0)
+
+// ---- lane/async-readback (workstream A) -----------------------------------------------------
+// The Vulkan backend already exposes a *deferred* readback: ggml_backend_vk_get_tensor_2d_async
+// records the vkCmdCopyBuffer into the live compute context and returns without submitting or
+// waiting. ggml_backend_synchronize() then covers the whole dependency group with one submission
+// and one fence wait. The scheduler never used it for split input copies -- it called
+// ggml_backend_tensor_copy(), which for Vulkan->host goes through ggml_vk_buffer_read_2d(): a
+// temporary context, one submit and one blocking fence wait *per copy*.
+//
+// That is pure latency on the tiny, latency-dominated families (ffn_moe_topk is ~2 KiB per copy
+// and pays a ~65 us round trip). This batches those readbacks into one synchronisation boundary.
+//
+// ALICE_ASYNC_READBACK:
+//   off | 0     -> disabled (upstream behaviour; reproduces the pre-change baseline)
+//   topk | 1    -> only ffn_moe_topk*  (A1)
+//   inp | 2     -> ffn_moe_topk* and ffn_inp*  (A2)
+//   all | 3     -> every eligible split input copy  (A3, DEFAULT)
+// ALICE_ASYNC_READBACK_SKIP_SYNC=0 restores the per-input producer synchronise. Dropping it is
+// what makes the change pay off (it is the second of the two boundaries each ffn_inp copy used to
+// pay); it is safe because the deferred copy is ordered after the producer in the same queue and
+// the batched synchronise below still runs before the split is dispatched.
+static int alice_ar_families(void) {
+    static const int v = [] {
+        const char * e = getenv("ALICE_ASYNC_READBACK");
+        if (e == nullptr || e[0] == '\0') {
+            return 3;
+        }
+        if (strcmp(e, "off") == 0 || strcmp(e, "0") == 0) return 0;
+        if (strcmp(e, "topk") == 0 || strcmp(e, "1") == 0) return 1;
+        if (strcmp(e, "inp") == 0 || strcmp(e, "2") == 0) return 2;
+        if (strcmp(e, "all") == 0 || strcmp(e, "3") == 0) return 3;
+        return 3;
+    }();
+    return v;
+}
+
+static bool alice_ar_skip_producer_sync(void) {
+    static const bool v = [] {
+        const char * e = getenv("ALICE_ASYNC_READBACK_SKIP_SYNC");
+        return e == nullptr || e[0] == '\0' || e[0] != '0';
+    }();
+    return v;
+}
+
+// Would this input copy take the deferred readback path?
+//
+// Restricted to backends that implement get_tensor_2d_async -- the hook that means "record this
+// readback into the live compute context and let the backend's own synchronize() flush it"
+// (Vulkan, CUDA, Hexagon). Everything else, notably the CPU/BLAS/RPC/Metal backends, is left on
+// the upstream path. Verified only on the Vulkan backend (RADV gfx1200); see the lane receipt.
+static bool alice_ar_gate(const struct ggml_tensor * input, const struct ggml_tensor * input_cpy,
+                          ggml_backend_t input_backend, ggml_backend_t split_backend) {
+    const int families = alice_ar_families();
+    if (families == 0) {
+        return false;
+    }
+    if (input_backend == nullptr || input_backend->iface.get_tensor_async == nullptr ||
+        input_backend->iface.get_tensor_2d_async == nullptr) {
+        return false;
+    }
+    if (input_backend == split_backend) {
+        return false;
+    }
+    // only the device -> host direction has a deferred path; the host -> device direction is
+    // already handled by cpy_tensor_async / the deferred copy context
+    if (ggml_backend_buffer_is_host(input->buffer) || !ggml_backend_buffer_is_host(input_cpy->buffer)) {
+        return false;
+    }
+    if (families < 3) {
+        const char * name = input->name;
+        const bool is_topk = strncmp(name, "ffn_moe_topk", 12) == 0;
+        const bool is_inp  = strncmp(name, "ffn_inp", 7) == 0;
+        if (families == 1 && !is_topk) return false;
+        if (families == 2 && !(is_topk || is_inp)) return false;
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1653,14 +1841,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    const bool mc_on = ALICE_MC_ON();
+    const uint64_t mc_cs_t0 = mc_on ? alice_mc_now_ns() : 0;
+    uint64_t mc_cs_barrier = 0, mc_cs_copy = 0, mc_cs_dispatch = 0, mc_cs_moe = 0;
+    uint64_t mc_cs_ids = 0, mc_cs_set = 0, mc_cs_event = 0, mc_cs_bytes = 0;
+    int mc_cs_groups = 0, mc_cs_moe_in = 0, mc_cs_experts = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        const uint64_t mc_sp_t0 = mc_on ? alice_mc_now_ns() : 0;
+        uint64_t mc_sp_barrier = 0, mc_sp_copy = 0, mc_sp_dispatch = 0, mc_sp_moe = 0;
+        uint64_t mc_sp_ids = 0, mc_sp_set = 0, mc_sp_event = 0, mc_sp_bytes = 0;
+        int mc_sp_groups = 0, mc_sp_moe_in = 0, mc_sp_experts = 0;
+
+        // lane/async-readback: deferred Vulkan -> host readbacks issued for this split
+        ggml_backend_t ar_backend = nullptr;
+        int ar_n = 0;
+        size_t ar_bytes = 0;
+        uint64_t ar_sync_ns = 0, ar_sub0 = 0, ar_wait0 = 0;
+        const bool ar_skip_sync = alice_ar_skip_producer_sync();
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            alice_mc_timer mc_t(&mc_sp_barrier);
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1670,9 +1877,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            alice_mc_timer mc_t_copy(&mc_sp_copy);
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            if (mc_on) {
+                alice_mc_copy_begin(input, input_cpy, split_id, tensor_backend_id(input), split_backend_id);
+            }
+            alice_mc_copy_guard mc_cpy_guard(mc_on);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1681,6 +1893,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                AMC_PRE();
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
@@ -1701,6 +1914,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+
+                    const uint64_t mc_ids_t0 = mc_on ? alice_mc_now_ns() : 0;
+                    mc_sp_moe_in++;
+                    alice_mc_timer mc_t_moe(&mc_sp_moe);
 
                     ggml_backend_synchronize(input_backend);
 
@@ -1741,6 +1958,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    if (mc_on) {
+                        mc_sp_ids += alice_mc_now_ns() - mc_ids_t0;
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -1748,6 +1969,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        mc_sp_groups++;
+                        mc_sp_bytes += expert_size_copy + padding_end;
+                        alice_mc_note(AMC_PATH_MOE_GROUP);
+                        AMC_PRE();
+                        alice_mc_timer mc_t_set(&mc_sp_set);
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
@@ -1768,6 +1994,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             continue;
                         }
 
+                        mc_sp_experts++;
+
                         if (id == last_id + 1) {
                             last_id = id;
                             continue;
@@ -1780,6 +2008,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // lane/async-readback: Vulkan -> host inputs go through the deferred
+                    // readback; the copy lands in the live compute context and the single
+                    // batched synchronise below submits and waits for all of them at once.
+                    if (alice_ar_gate(input, input_cpy, input_backend, split_backend)) {
+                        if (!ar_skip_sync) {
+                            ggml_backend_synchronize(input_backend);
+                        }
+                        AMC_PRE();
+                        ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                        ar_backend = input_backend;
+                        ar_n++;
+                        ar_bytes += ggml_nbytes(input);
+                        continue;
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1789,14 +2031,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        AMC_PRE();
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
             }
         }
 
+        // lane/async-readback: one submission + one fence wait for every deferred Vulkan -> host
+        // readback of this split, instead of one temporary-context round trip per copy. This must
+        // happen before the split is dispatched: the CPU split reads the copy buffers directly,
+        // and it also guarantees the deferred copies have landed before any later Vulkan split
+        // can have ggml-alloc recycle the producer's buffer region.
+        if (ar_backend != nullptr) {
+            ar_sub0  = alice_mc_vk_submit;
+            ar_wait0 = alice_mc_vk_wait;
+            const uint64_t ar_t0 = mc_on ? alice_mc_now_ns() : 0;
+            ggml_backend_synchronize(ar_backend);
+            if (mc_on) {
+                ar_sync_ns = alice_mc_now_ns() - ar_t0;
+                ALICE_MC_EV("AR split=%d n=%d bytes=%llu sync_ns=%llu sub=%llu wait=%llu skip_sync=%d",
+                        split_id, ar_n, (unsigned long long) ar_bytes, (unsigned long long) ar_sync_ns,
+                        (unsigned long long) (alice_mc_vk_submit - ar_sub0),
+                        (unsigned long long) (alice_mc_vk_wait - ar_wait0), (int) ar_skip_sync);
+            }
+            ar_backend = nullptr;
+        }
+
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec;
+            {
+                alice_mc_timer mc_t(&mc_sp_dispatch);
+                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1836,10 +2103,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            alice_mc_timer mc_t(&mc_sp_event);
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        if (mc_on) {
+            ALICE_MC_EV("SP %d %d %d %d %llu %llu %llu %llu %llu %llu %llu %llu %d %d %llu %d",
+                    split_id, split_backend_id, split->n_inputs, split->graph.n_nodes,
+                    (unsigned long long) (alice_mc_now_ns() - mc_sp_t0),
+                    (unsigned long long) mc_sp_barrier, (unsigned long long) mc_sp_copy,
+                    (unsigned long long) mc_sp_moe, (unsigned long long) mc_sp_ids,
+                    (unsigned long long) mc_sp_set, (unsigned long long) mc_sp_dispatch,
+                    (unsigned long long) mc_sp_event, mc_sp_groups, mc_sp_moe_in,
+                    (unsigned long long) mc_sp_bytes, mc_sp_experts);
+            mc_cs_barrier  += mc_sp_barrier;
+            mc_cs_copy     += mc_sp_copy;
+            mc_cs_dispatch += mc_sp_dispatch;
+            mc_cs_moe      += mc_sp_moe;
+            mc_cs_ids      += mc_sp_ids;
+            mc_cs_set      += mc_sp_set;
+            mc_cs_event    += mc_sp_event;
+            mc_cs_bytes    += mc_sp_bytes;
+            mc_cs_groups   += mc_sp_groups;
+            mc_cs_moe_in   += mc_sp_moe_in;
+            mc_cs_experts  += mc_sp_experts;
+        }
+
         prev_backend_id = split_backend_id;
+    }
+
+    if (mc_on) {
+        ALICE_MC_EV("CS %d %llu %llu %llu %llu %llu %llu %llu %llu %llu %d %d %d",
+                sched->n_splits, (unsigned long long) (alice_mc_now_ns() - mc_cs_t0),
+                (unsigned long long) mc_cs_barrier, (unsigned long long) mc_cs_copy,
+                (unsigned long long) mc_cs_dispatch, (unsigned long long) mc_cs_moe,
+                (unsigned long long) mc_cs_ids, (unsigned long long) mc_cs_set,
+                (unsigned long long) mc_cs_event, (unsigned long long) mc_cs_bytes,
+                mc_cs_groups, mc_cs_moe_in, mc_cs_experts);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1997,9 +2297,18 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    const bool mc_on = ALICE_MC_ON();
+    const uint64_t mc_a1 = mc_on ? alice_mc_now_ns() : 0;
     ggml_backend_sched_split_graph(sched, graph);
-
-    if (!ggml_backend_sched_alloc_splits(sched)) {
+    const uint64_t mc_a2 = mc_on ? alice_mc_now_ns() : 0;
+    const bool mc_alloc_ok = ggml_backend_sched_alloc_splits(sched);
+    if (mc_on) {
+        ALICE_MC_EV("AG %llu %llu %d %d %d",
+                (unsigned long long) (mc_a2 - mc_a1),
+                (unsigned long long) (alice_mc_now_ns() - mc_a2),
+                graph->n_nodes, graph->n_leafs, sched->n_splits);
+    }
+    if (!mc_alloc_ok) {
         return false;
     }
 
