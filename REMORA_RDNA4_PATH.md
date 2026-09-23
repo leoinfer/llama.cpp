@@ -20,7 +20,7 @@ measurement reproducible rather than to be a good default.
 | Readback/submission batching | Vulkan→host split-input readbacks batched into a single synchronization boundary (the change behind the historical 18.430 tokens/s decode record), plus per-copy submit/wait counters so the scheduler's copy behaviour can be attributed. |
 | MIX34 (type 44) | A 640-value block layout (20 × 32-value subblocks: 12 IQ4_NL + 8 D32A3 plus a selector word, 4.15 bpw) with CPU dot/type-trait support and a Vulkan dequant/mat-vec path. |
 | Expert residency and feed | Freeze-first expert residency controls, owned-queue fills with readahead on registered mappings, and the routed-expert slab prefetch engine measured by the Flash-Next campaign. |
-| Routing instrumentation | A route-trace probe and an eval-callback tensor dump for capturing real routing decisions. |
+| Routing instrumentation | `ALICE_MOE_TRACE` writes a binary per-position route trace (header plus an `int32` payload) and `ALICE_MOE_STATS` accumulates route mass, so the routed decisions a residency or representation decision is based on can be captured from a real run rather than modelled. |
 
 ## What is deliberately not in this branch
 
@@ -45,6 +45,23 @@ ROCm/HIP-only or Vulkan-only builds work the same way by dropping the other
 flag. `gfx1200` is the reference target; substitute your own GPU target, and
 expect measured behaviour to differ — every number in the REMORA Lab research
 records is a single-machine phenotype, not a portability claim.
+
+## Verify the correctness fix
+
+The recurrent snapshot convention is covered by a model-free known-answer test
+that needs no model, no server and no GPU:
+
+```sh
+cmake --build build -j --target test-gdn-state-snapshots
+./build/bin/test-gdn-state-snapshots
+```
+
+It checks four things: a fused multi-token run against a serial decode (scores
+and per-token states, bit-exact), rollback by restoring a snapshot and
+re-scanning the suffix, the caller-owned guard for slots past
+`min(n_tokens, K)`, and the conv-plane convention that plane `r` must be the
+conv window `r` tokens back. Before the fix it reports 682 checks / 276
+failures, all in the conv-plane section; after, zero.
 
 ## Using it
 
