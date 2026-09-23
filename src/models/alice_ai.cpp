@@ -887,7 +887,7 @@ static void alice_hotbank_load(llama_model_alice_ai & amodel) {
     if (done) { return; }
     done = true;
     const char * path = std::getenv("ALICE_HOTBANK_PATH");
-    if (!path || !*path) { path = "/home/leo/research/alice-deploy/weights/alice-hotbank-2gib.ahb1"; }
+    if (!path || !*path) { path = "alice-hotbank-2gib.ahb1"; }
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[hotbank] cannot open %s; disabled\n", path); return; }
     char magic[4];
