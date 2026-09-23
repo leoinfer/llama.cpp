@@ -1,4 +1,5 @@
 #include "models.h"
+#include "models/recurrent-snapshot.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -1174,10 +1175,10 @@ static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_t
     const int64_t K = (int64_t) n_rs_seq + 1;
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
     for (int64_t slot = 0; slot < n_written; ++slot) {
-        // conv_x dim0 = (d_conv-1) + n_seq_tokens; the snapshot for slot j is the
-        // (d_conv-1)-window ending j tokens into the ubatch. Clamp the offset so
-        // the view stays in-bounds when n_seq_tokens < K (ggml asserts otherwise).
-        const int64_t off = std::min<int64_t>(slot, std::max<int64_t>(0, conv_x->ne[0] - (d_conv - 1)));
+        // conv_x dim0 = (d_conv-1) + n_seq_tokens; the snapshot for rollback
+        // depth `slot` is the (d_conv-1)-window ending `slot` tokens before the
+        // last token of the ubatch. Shared arithmetic: see recurrent-snapshot.h.
+        const int64_t off = llm_conv_snapshot_offset(n_seq_tokens, slot);
         ggml_tensor * conv_snap = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2],
             off * conv_x->nb[0]);

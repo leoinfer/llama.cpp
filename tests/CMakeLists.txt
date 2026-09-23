@@ -324,6 +324,9 @@ endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
+    llama_build_and_test(test-gdn-state-snapshots.cpp)
+    # the KAT shares the recurrent-snapshot plane arithmetic with src/models/*
+    target_include_directories(test-gdn-state-snapshots PRIVATE ${CMAKE_SOURCE_DIR}/src)
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)

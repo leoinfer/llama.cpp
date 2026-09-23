@@ -2651,6 +2651,21 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    //
+    // the snapshots are EMITTED BY THIS OP, in its own output (no side buffer and no second
+    // pass): the tensor is 2D [S_v*H_v, n_tokens*n_seqs + K*S_v*n_seqs] and slot s occupies the
+    // contiguous block
+    //     data + S_v*H_v*n_tokens*n_seqs + s*S_v*S_v*H_v*n_seqs
+    // with the same (seq-major, head-minor) order as the single-slot state, i.e. element
+    // (row i, col j, head h, seq b) of slot s at j + i*S_v + (h + b*H_v)*S_v*S_v. Slots
+    // s >= min(n_tokens, K) belong to the caller and MUST NOT be touched.
+    //
+    // slot s is the plane index a rollback of s tokens restores (llama_memory_recurrent::s_copy
+    // indexes the recurrent cache by rollback depth), so a caller that copies the slots into a
+    // (1 + K) plane cache gets a state it can restore a rejected draft row from.
+    //
+    // regression test: tests/test-gdn-state-snapshots.cpp (fused run vs serial decode, rollback
+    // at every position, multi-sequence, and the unwritten-slot guard).
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

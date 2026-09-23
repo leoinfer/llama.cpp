@@ -10955,6 +10955,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+    // Slot s is the plane index a rollback of s tokens restores, so the caller can copy
+    // the slots straight into a (1 + K) plane recurrent cache. Verified against a serial
+    // scan by tests/test-gdn-state-snapshots.cpp.
 
     const float * state_in_base = (const float *)src_state->data;
 
