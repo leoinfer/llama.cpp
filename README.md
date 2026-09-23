@@ -1,5 +1,16 @@
 # llama.cpp
 
+> **This is the REMORA Lab RDNA4/ROCm research fork.** The default branch is
+> `rdna4-rocm-2026-09-22`, a research branch carrying the local-inference
+> work: the `alice_ai` hybrid linear-attention MoE architecture, the
+> recurrent-snapshot rollback correctness fix and its known-answer test, the
+> host expert tier and arena, the readback/submission batching, and the MIX34
+> type. It builds ROCm/HIP and Vulkan from one tree. What is in it, how to
+> build it, and how to verify the correctness fix: [`REMORA_RDNA4_PATH.md`](REMORA_RDNA4_PATH.md).
+> The measurements, negative results, and exact configurations live in the
+> REMORA Lab research repository, not here. For upstream llama.cpp, use
+> `master` and <https://github.com/ggml-org/llama.cpp>.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
