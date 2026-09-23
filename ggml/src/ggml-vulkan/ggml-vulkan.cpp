@@ -267,7 +267,6 @@ static bool ggml_vk_tensor_host_buffer(const ggml_backend_vk_context * ctx, cons
     return buf != nullptr;
 }
 
-static size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
 size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
     {
