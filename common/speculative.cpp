@@ -2566,9 +2566,18 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
-    // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-    //       the extra memory for small models is likely negligible?
-    cparams.n_rs_seq  = 0;
+    // The draft context must be able to drop a rejected speculative suffix. That
+    // is what n_rs_seq buys: llama_memory_recurrent::seq_rm refuses a partial
+    // rollback unless `rollback <= n_rs_seq`, and common_context_seq_rm ABORTS on a
+    // false return. Left at 0, every partial-acceptance rollback on a hybrid draft
+    // context is fatal -- observed as "failed to remove sequence N with p0=N, p1=-1"
+    // on the first real MTP decode. Sized from the same helper the target context
+    // uses, so the two agree by construction.
+    // n_max + 1: the server rolls back spec_draft.size() + 1 - accepted.size()
+    // tokens, which reaches n_max + 1 when nothing is accepted, while
+    // need_n_rs_seq() returns only n_max. One short and seq_rm refuses the
+    // rollback (it requires rollback <= n_rs_seq) and common_context_seq_rm aborts.
+    cparams.n_rs_seq  = params.speculative.need_n_rs_seq() + 1;
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;

@@ -1,0 +1,191 @@
+#version 450
+
+// Dedicated MIX34 mat-vec / mat-vec-id (MoE) shader. Correctness-first, no full FP materialization.
+//
+// MIX34 layout (authority: ggml/src/ggml-quants.c dequantize_row_mix34 + the frozen v1.g spec):
+//   640 values per ggml block = 20 subblocks of 32 values. Selector bit s (s = 0..19) chooses the
+//   component of subblock s: 0 -> D32A3 (14 B payload), 1 -> IQ4_NL (18 B payload).
+//   Payload order is the CPU decoder's and must not be reinterpreted: the D32A3 payloads occupy
+//   [0, 112) in increasing subblock order, then the IQ4_NL payloads occupy [112, 332). The encoder
+//   guarantees exactly 12 selector bits are set, so that split is a constant; both regions are walked
+//   with a running offset per block, exactly as the CPU decoder does.
+//     D32A3 payload: float16 d, then 12 B = 32 three-bit codes packed LSB-first; code k pairs with column k.
+//     IQ4_NL payload: float16 d, then 16 B; COLUMN j < 16 IS THE LOW NIBBLE OF BYTE j AND COLUMN
+//       j + 16 IS THE HIGH NIBBLE OF BYTE j (interleaved layout, NOT a sequential nibble stream).
+//
+// Written against the representation itself instead of the shared mul_mat_vec.comp dequantize4
+// contract, which cannot express a per-subblock codec choice.
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+// Codebooks are indexed by data-dependent codes; a dynamic index into a private const array forces a
+// scratch-memory spill on most compilers, so they live in shared memory.
+shared float kvalues_d32a3_sh[8];
+shared float kvalues_iq4nl_sh[16];
+const float kvalues_d32a3_mv[8] = float[8](
+    -2.151945, -1.343910, -0.756005, -0.245094, 0.245094, 0.756005, 1.343910, 2.151945);
+const float kvalues_iq4nl_mv[16] = float[16](
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+void init_mix34_shmem() {
+    if (gl_LocalInvocationID.x < 8) {
+        kvalues_d32a3_sh[gl_LocalInvocationID.x] = kvalues_d32a3_mv[gl_LocalInvocationID.x];
+    }
+    if (gl_LocalInvocationID.x < 16) {
+        kvalues_iq4nl_sh[gl_LocalInvocationID.x] = kvalues_iq4nl_mv[gl_LocalInvocationID.x];
+    }
+    barrier();
+}
+
+// The payload is addressed in bytes but stored as 16-bit words; every payload scale lands on an even
+// byte offset (14 and 18 are both even, and the IQ4_NL region starts at 112), so no punning is needed.
+uint mix34_byte(const uint ibi, const uint off) {
+    return uint(data_a[ibi].payload[off >> 1] >> (8u * (off & 1u))) & 0xFFu;
+}
+
+float mix34_scale(const uint ibi, const uint off) {
+    return unpackHalf2x16(uint(data_a[ibi].payload[off >> 1])).x;
+}
+
+// Each MIX34 block holds 20 subblocks; handing a whole block to one thread would leave most of the
+// workgroup idle (a row is only p.ncols/640 blocks wide). A block is therefore split into
+// MIX34_SPLIT slices of MIX34_SUBS_PER_SLICE subblocks, and the slice's payload offsets come from the
+// selector's popcount below the slice start. Decoding semantics are unchanged.
+#define MIX34_SPLIT_NUM 20
+#define MIX34_SPLIT (MIX34_SPLIT_NUM + 0u)
+#define MIX34_SUBS_PER_SLICE (MIX34_SPLIT_NUM / MIX34_SPLIT_NUM * (MIX34_SPLIT_NUM / MIX34_SPLIT))
+#if (20 % MIX34_SPLIT_NUM) != 0
+#error "MIX34_SPLIT_NUM must divide the 20 subblocks per block, otherwise some subblocks are never decoded"
+#endif
+
+void calc_slice(const uint a_offset, const uint b_offset, const uint iblk, const uint slice,
+                const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint y_idx = iblk * QUANT_K;
+    const uint s0    = slice * MIX34_SUBS_PER_SLICE;
+    const uint s1    = s0 + MIX34_SUBS_PER_SLICE;
+
+    uint ibi = a_offset + first_row * num_blocks_per_row + iblk;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint selector = data_a[ibi].selector;
+
+        // payload offsets at the start of the slice, from the selector bits below s0
+        const uint mask_below = (s0 == 0u) ? 0u : ((1u << s0) - 1u);
+        const uint n4_below   = bitCount(selector & mask_below);
+        uint off3 = 14u  * (s0 - n4_below);
+        uint off4 = 8u * 14u + 18u * n4_below;
+
+        FLOAT_TYPE sum[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            sum[j] = FLOAT_TYPE(0);
+        }
+
+        for (uint s = s0; s < s1; ++s) {
+            FLOAT_TYPE sub[NUM_COLS];
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                sub[j] = FLOAT_TYPE(0);
+            }
+
+            const uint  col = y_idx + 32u * s;
+            const float d   = (((selector >> s) & 1u) == 0u) ? mix34_scale(ibi, off3) : mix34_scale(ibi, off4);
+
+            if (((selector >> s) & 1u) == 0u) {
+                // D32A3: 32 three-bit codes, LSB-first, columns col + 0 .. col + 31 in order.
+                const uint qs = off3 + 2u;
+                [[unroll]] for (uint l = 0; l < 4u; ++l) {
+                    const uint o = qs + 3u * l;
+                    const uint w = mix34_byte(ibi, o) | (mix34_byte(ibi, o + 1u) << 8) | (mix34_byte(ibi, o + 2u) << 16);
+                    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                        const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 8u*l) / 4u]);
+                        const vec4 b1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 8u*l) / 4u + 1u]);
+                        sub[j] = fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(kvalues_d32a3_sh[(w      ) & 7u]),
+                                 fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(kvalues_d32a3_sh[(w >>  3) & 7u]),
+                                 fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(kvalues_d32a3_sh[(w >>  6) & 7u]),
+                                 fma(FLOAT_TYPE(b0.w), FLOAT_TYPE(kvalues_d32a3_sh[(w >>  9) & 7u]),
+                                 fma(FLOAT_TYPE(b1.x), FLOAT_TYPE(kvalues_d32a3_sh[(w >> 12) & 7u]),
+                                 fma(FLOAT_TYPE(b1.y), FLOAT_TYPE(kvalues_d32a3_sh[(w >> 15) & 7u]),
+                                 fma(FLOAT_TYPE(b1.z), FLOAT_TYPE(kvalues_d32a3_sh[(w >> 18) & 7u]),
+                                 fma(FLOAT_TYPE(b1.w), FLOAT_TYPE(kvalues_d32a3_sh[(w >> 21) & 7u]),
+                                 sub[j]))))))));
+                    }
+                }
+                off3 += 14u;
+            } else {
+                // IQ4_NL: byte 4l+m supplies column col + 4l + m (low nibble) and column col + 16 + 4l + m
+                // (high nibble). The 32-bit word packs bytes 4l..4l+3 little-endian, so byte m lives at bit 8m.
+                const uint qs = off4 + 2u;
+                [[unroll]] for (uint l = 0; l < 4u; ++l) {
+                    const uint o = qs + 4u * l;
+                    const uint w = mix34_byte(ibi, o) | (mix34_byte(ibi, o + 1u) << 8) |
+                                   (mix34_byte(ibi, o + 2u) << 16) | (mix34_byte(ibi, o + 3u) << 24);
+                    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                        const vec4 lo = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 4u*l) / 4u]);
+                        const vec4 hi = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col + 16u + 4u*l) / 4u]);
+                        sub[j] = fma(FLOAT_TYPE(lo.x), FLOAT_TYPE(kvalues_iq4nl_sh[(w      ) & 0xFu]),
+                                 fma(FLOAT_TYPE(lo.y), FLOAT_TYPE(kvalues_iq4nl_sh[(w >>  8) & 0xFu]),
+                                 fma(FLOAT_TYPE(lo.z), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 16) & 0xFu]),
+                                 fma(FLOAT_TYPE(lo.w), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 24) & 0xFu]),
+                                 fma(FLOAT_TYPE(hi.x), FLOAT_TYPE(kvalues_iq4nl_sh[(w >>  4) & 0xFu]),
+                                 fma(FLOAT_TYPE(hi.y), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 12) & 0xFu]),
+                                 fma(FLOAT_TYPE(hi.z), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 20) & 0xFu]),
+                                 fma(FLOAT_TYPE(hi.w), FLOAT_TYPE(kvalues_iq4nl_sh[(w >> 28) & 0xFu]),
+                                 sub[j]))))))));
+                    }
+                }
+                off4 += 18u;
+            }
+
+            // the subblock scale is applied once per column, mirroring the CPU's d * level per value
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                sum[j] = fma(FLOAT_TYPE(d), sub[j], sum[j]);
+            }
+        }
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            temp[j][n] += sum[j];
+        }
+
+        ibi += num_blocks_per_row;
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint tid = gl_LocalInvocationID.x;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    // MIX34_SPLIT independent slices per block, so the workgroup stays busy with wide blocks
+    const uint num_tasks = num_blocks_per_row * MIX34_SPLIT;
+    for (uint t = tid; t < num_tasks; t += gl_WorkGroupSize.x)
+        calc_slice(a_offset, b_offset, t / MIX34_SPLIT, t % MIX34_SPLIT, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    init_mix34_shmem();
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

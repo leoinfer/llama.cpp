@@ -148,6 +148,28 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 }
 
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+    // --- MTP presence detection -----------------------------------------
+    // The MTP block is an OPTIONAL part of the artifact. Metadata declaring it
+    // is a promise, not a fact, so probe for the head tensors and compare.
+    // Section 43: a declared-but-absent MTP block must be a hard error. The
+    // failure this prevents is the quiet one -- a loader that silently drops
+    // MTP while the CLI/user believes it is enabled, which would make any
+    // later throughput number meaningless.
+    const bool mtp_declared = hparams.n_layer_nextn > 0;
+    const bool mtp_present  = ml.get_weight("nextn.fc_embedding.weight") != nullptr;
+    if (mtp_declared && ml.load_mtp && !mtp_present) {
+        throw std::runtime_error(format(
+            "metadata declares mtp_num_hidden_layers=%u but the MTP head tensors "
+            "(nextn.fc_embedding) are absent. Refusing to load with MTP requested "
+            "and unavailable: re-convert with MTP export enabled, or disable MTP "
+            "explicitly.", hparams.n_layer_nextn));
+    }
+    if (!mtp_declared && mtp_present) {
+        throw std::runtime_error(
+            "MTP head tensors are present but the model does not declare "
+            "nextn_predict_layers -- the artifact is inconsistent");
+    }
+
     LLAMA_LOAD_LOCALS;
 
     const int64_t hc     = hparams.dsv4_hc_mult;
@@ -256,9 +278,74 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
     }
+
+    // --- MTP draft block -------------------------------------------------
+    // The draft block is a single decoder layer stored at index n_layer()
+    // (== n_layer_all - n_layer_nextn). It is a FULL-attention layer: the
+    // config's mtp.layer_types is ["full_attention"], so the recurrent branch
+    // never applies and these shapes mirror the !is_recr branch above exactly.
+    //
+    // mtp_flags mirrors qwen35: a trunk-only load skips the whole block rather
+    // than failing, so the same GGUF serves both --mtp off and --mtp on.
+    if (hparams.n_layer_nextn > 0) {
+        const int mtp_flags = ml.load_mtp ? 0 : TENSOR_SKIP;
+        const int il_mtp    = (int) hparams.n_layer();
+        auto & layer = layers[il_mtp];
+
+        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
+        const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+
+        // two HC modules, identical shapes to a trunk layer
+        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il_mtp), { hc_dim }, mtp_flags);
+        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il_mtp), { hc_dim, hc_lr }, mtp_flags);
+        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il_mtp), { hc_lr, hc_dim }, mtp_flags);
+        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il_mtp), { hc_dim, hc }, mtp_flags);
+        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il_mtp), { hc_dim }, mtp_flags);
+        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il_mtp), { hc_dim, hc_lr }, mtp_flags);
+        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il_mtp), { hc_lr, hc_dim }, mtp_flags);
+        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il_mtp), { hc_dim, hc }, mtp_flags);
+
+        // full attention, including the q|gate interleave
+        create_tensor_qkv(layer, il_mtp, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il_mtp), { n_embd_head_k * n_head, n_embd }, mtp_flags);
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il_mtp), { n_embd_head_k }, mtp_flags);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il_mtp), { n_embd_head_k }, mtp_flags);
+
+        // QSA indexer
+        const int64_t idx_dim = hparams.indexer_head_size;
+        layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il_mtp), { n_embd, hparams.indexer_n_head * idx_dim }, mtp_flags);
+        layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il_mtp), { n_embd, idx_dim }, mtp_flags);
+        layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il_mtp), { idx_dim }, mtp_flags);
+        layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il_mtp), { idx_dim }, mtp_flags);
+
+        // MoE, same shapes as a trunk layer
+        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il_mtp), { n_embd, n_expert }, mtp_flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il_mtp), { n_ff_exp, n_embd, n_expert }, mtp_flags);
+        create_tensor_gate_up_exps(layer, il_mtp, n_embd, n_ff_exp, n_expert, mtp_flags);
+
+        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il_mtp), { n_embd }, mtp_flags);
+        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il_mtp), { n_embd, n_ff_shexp }, mtp_flags);
+        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il_mtp), { n_embd, n_ff_shexp }, mtp_flags);
+        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il_mtp), { n_ff_shexp, n_embd }, mtp_flags);
+
+        // the 7 MTP-unique OUTER tensors: no block index
+        mtp_fc_embedding          = create_tensor(tn(LLM_TENSOR_NEXTN_FC_EMBEDDING,          "weight"), { n_embd, n_embd }, mtp_flags);
+        mtp_fc_hidden             = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN,             "weight"), { n_embd, n_embd }, mtp_flags);
+        mtp_pre_fc_norm_embedding = create_tensor(tn(LLM_TENSOR_NEXTN_PRE_FC_NORM_EMBEDDING, "weight"), { n_embd },   mtp_flags);
+        mtp_pre_fc_norm_hidden    = create_tensor(tn(LLM_TENSOR_NEXTN_PRE_FC_NORM_HIDDEN,    "weight"), { hc_dim },   mtp_flags);
+        mtp_hc_mixer_norm         = create_tensor(tn(LLM_TENSOR_NEXTN_HC_MIXER_NORM,         "weight"), { hc_dim },   mtp_flags);
+        mtp_hc_mixer_down         = create_tensor(tn(LLM_TENSOR_NEXTN_HC_MIXER_DOWN,         "weight"), { hc_dim, hc_lr }, mtp_flags);
+        mtp_hc_mixer_up           = create_tensor(tn(LLM_TENSOR_NEXTN_HC_MIXER_UP,           "weight"), { hc_lr, hc_dim }, mtp_flags);
+
+        has_mtp = ml.load_mtp;
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        GGML_ASSERT(has_mtp && "MTP graph requested but the MTP block was not loaded");
+        return std::make_unique<graph>(*this, params, /*mtp_only=*/true);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -350,7 +437,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
-llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params, bool mtp_only) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
 
@@ -377,6 +464,124 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // ---- MTP draft block -------------------------------------------------
+    // One full-attention decoder layer plus the fusion/mixer pair, reproducing
+    // mtp_forward(). The trunk is not built at all here: res->t_logits is the
+    // draft head's logits and res->t_h_nextn is the 4-stream hidden that chains
+    // into the next draft step.
+    if (mtp_only) {
+        const int il_mtp = (int) hparams.n_layer();
+        const auto & layer = model.layers[il_mtp];
+
+        GGML_ASSERT(model.mtp_fc_embedding && "MTP: nextn.fc_embedding is missing");
+
+        const int64_t nt      = n_tokens;
+        const int64_t hc_dim  = hc * n_embd;
+        const int64_t n_embd_out = hparams.n_embd_out();
+        GGML_ASSERT(n_embd_out == hc_dim);
+
+        // Inputs. `tokens` supplies the previous token (embedded through the base
+        // table -- the MTP segment has no embedding table of its own), and `h`
+        // carries the target's pre-final-mixer 4-stream hidden. The driver fills
+        // both: batch.token holds the token id and batch.embd holds pending_h.
+        auto inp_mtp = std::make_unique<llm_graph_input_embd_h>(n_embd_out);
+
+        inp_mtp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nt);
+        ggml_set_input(inp_mtp->tokens);
+
+        // unused on the token path, but set_input() dereferences it off that path
+        inp_mtp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_out, nt);
+        ggml_set_input(inp_mtp->embd);
+
+        inp_mtp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_out, nt);
+        ggml_set_input(inp_mtp->h);
+        ggml_set_name(inp_mtp->h, "mtp_h_input");
+
+        ggml_tensor * y_prev = ggml_get_rows(ctx0, model.tok_embd, inp_mtp->tokens);
+        cb(y_prev, "mtp_tok_embd", il_mtp);
+
+        ggml_tensor * h_in = inp_mtp->h;
+        res->add_input(std::move(inp_mtp));
+
+        // e = fc_embedding(rms_norm(y_prev))            [n_embd, nt]
+        ggml_tensor * e = build_norm(y_prev, model.mtp_pre_fc_norm_embedding, nullptr, LLM_NORM_RMS, il_mtp);
+        e = build_lora_mm(model.mtp_fc_embedding, e);
+        cb(e, "mtp_e", il_mtp);
+
+        // h_n = fc_hidden(rms_norm(h)) applied PER HC BRANCH:
+        // reshape [hc_dim, nt] -> [n_embd, hc, nt] so ggml_rms_norm reduces over
+        // one stream, then flatten to [n_embd, hc*nt] so one matmul hits each
+        // branch. Scaling by the [hc_dim] gamma after the reshape is the grouped
+        // norm the reference does with group_size=hidden_size.
+        ggml_tensor * hn = ggml_reshape_3d(ctx0, h_in, n_embd, hc, nt);
+        hn = ggml_rms_norm(ctx0, hn, hparams.f_norm_rms_eps);
+        hn = ggml_reshape_2d(ctx0, hn, hc_dim, nt);
+        hn = ggml_mul(ctx0, hn, model.mtp_pre_fc_norm_hidden);
+        hn = ggml_reshape_2d(ctx0, hn, n_embd, hc * nt);
+        ggml_tensor * hf = build_lora_mm(model.mtp_fc_hidden, hn);
+        ggml_tensor * fused = ggml_reshape_3d(ctx0, hf, n_embd, hc, nt);
+        cb(fused, "mtp_fc_hidden", il_mtp);
+
+        // fused = h + e, the embedding residual broadcast to every branch
+        ggml_tensor * e3 = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, e, n_embd, 1, nt), n_embd, hc, nt, 1);
+        fused = ggml_add(ctx0, fused, e3);
+        cb(fused, "mtp_fused", il_mtp);
+
+        // --- the draft layer, identical to the trunk loop body -------------
+        ggml_tensor * inject = nullptr;
+        ggml_tensor * cur = build_hc_mix(fused,
+                layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up,
+                layer.hc_attn_inject, &inject, il_mtp);
+        ggml_build_forward_expand(gf, cur);
+
+        // always full attention: mtp.layer_types == ["full_attention"]
+        cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il_mtp);
+        cb(cur, "mtp_attn_out", il_mtp);
+
+        fused = build_hc_combine(fused, cur, inject, il_mtp);
+
+        cur = build_hc_mix(fused,
+                layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up,
+                layer.hc_ffn_inject, &inject, il_mtp);
+        cur = build_layer_ffn(cur, il_mtp);
+        cb(cur, "mtp_ffn_out", il_mtp);
+
+        fused = build_hc_combine(fused, cur, inject, il_mtp);
+        cb(fused, "mtp_multi", il_mtp);
+
+        // The chained hidden is the PRE-mixer 4-stream residual, captured before
+        // the final build_hc_mix. This is what the next draft step consumes as
+        // hidden_4stream, and it is what get_embeddings_nextn_ith reads back at
+        // width n_embd_out().
+        ggml_tensor * multi = ggml_reshape_2d(ctx0, fused, hc_dim, nt);
+        cb(multi, "h_nextn", -1);
+        ggml_build_forward_expand(gf, multi);
+        res->t_h_nextn = multi;
+
+        // sample hidden: the mixer collapses the 4 streams (use_combine=false)
+        ggml_tensor * sample = build_hc_mix(fused,
+                model.mtp_hc_mixer_norm, model.mtp_hc_mixer_down, model.mtp_hc_mixer_up,
+                nullptr, nullptr, -1);
+        cb(sample, "result_norm", -1);
+        res->t_embd = sample;
+
+        // Select the output rows BEFORE the head, exactly as the trunk does. Besides
+        // being the right shape for logits, this is what keeps inp_out_ids referenced:
+        // build_inp_out_ids() is called for every graph, and an input no node reaches
+        // is never allocated, so set_inputs would touch a bufferless tensor.
+        if (inp_out_ids) {
+            sample = ggml_get_rows(ctx0, sample, inp_out_ids);
+        }
+
+        // the draft head shares the base LM head -- nextn has no head of its own
+        ggml_tensor * logits = build_lora_mm(model.output, sample, model.output_s);
+        cb(logits, "result_output", -1);
+        res->t_logits = logits;
+        ggml_build_forward_expand(gf, logits);
+        return;
+    }
 
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
@@ -415,6 +620,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
+            // MTP needs the pre-final-mixer hidden at EVERY verified position, not just
+            // the sampled ones, so publish it from the residual BEFORE the gather.
+            // Deferring the gather instead (as this originally did) is wrong twice
+            // over: the LM head would then score every row, and inp_out_ids would
+            // become an input no node references -- which is never allocated, so
+            // set_inputs would touch a null buffer and abort.
+            if (cparams.embeddings_nextn) {
+                ggml_tensor * multi = ggml_reshape_2d(ctx0, res_hc, hc* n_embd, res_hc->ne[2]);
+                cb(multi, "h_nextn", -1);
+                ggml_build_forward_expand(gf, multi);
+                res->t_h_nextn = multi;
+            }
+
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -441,6 +659,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
     }
+
+    // Publish the pre-final-mixer 4-stream hidden for the MTP draft head. Row width
+    // is n_embd_out() == hc * n_embd, which is what get_embeddings_nextn_ith reads
+    // and what mtp_forward takes as `hidden_4stream`. Set BEFORE the out_ids gather
+    // so the chained draft sees every row.
+    // t_h_nextn was published in-loop from the pre-gather residual when the MTP
+    // target asked for it; the post-gather res_hc is the sampled rows only.
 
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,

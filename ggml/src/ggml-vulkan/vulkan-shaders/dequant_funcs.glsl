@@ -477,6 +477,26 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_D32A3)
+const float kvalues_d32a3[8] = float[8](-2.151945, -1.343910, -0.756005, -0.245094, 0.245094, 0.756005, 1.343910, 2.151945);
+// 3-bit code for column `col` of block `ib` (96-bit little-endian payload)
+uint d32a3_code(uint ib, uint col, uint a_offset) {
+    const uint bit   = 3u*col;
+    const uint byte0 = bit >> 3;
+    const uint shift = bit & 7;
+    uint w = uint(data_a[a_offset + ib].qs[byte0]);
+    if (byte0 + 1 < 12) { w |= uint(data_a[a_offset + ib].qs[byte0 + 1]) << 8; }
+    if (byte0 + 2 < 12) { w |= uint(data_a[a_offset + ib].qs[byte0 + 2]) << 16; }
+    return (w >> shift) & 7u;
+}
+// The generic shaders expect IQ4_NL-style pairing: v.x is written at column `iqs`,
+// v.y at column `iqs + QUANT_K/2`. Values are returned UNSCALED; get_dm() supplies the scale.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(kvalues_d32a3[d32a3_code(ib, iqs,               a_offset)],
+                kvalues_d32a3[d32a3_code(ib, iqs + QUANT_K/2,   a_offset)]);
+}
+#endif
+
 #if defined(DATA_A_IQ4_NL)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
@@ -558,7 +578,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL) || defined(DATA_A_D32A3)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }

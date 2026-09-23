@@ -259,6 +259,12 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // the device's own host (pinned) buffer type is also a valid placement target: weights stored
+        // there stay readable by that device, which is how a model larger than VRAM can be tiered
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft != nullptr && host_buft != ggml_backend_cpu_buffer_type()) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -2415,6 +2421,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_kv_offload = !value;
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
+    add_opt(common_arg(
+        {"--load-mtp"},
+        "load the MTP/nextn draft head when the artifact carries one (default: do not load it)",
+        [](common_params & params) {
+            params.load_mtp = true;
+        }
+    ));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},

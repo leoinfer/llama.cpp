@@ -25,12 +25,30 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # The MTP block is a real inference path, not training-only: vLLM publishes
+    # a concrete Qwen4Exp AMD MTP graph. transformers discards the weights via
+    # _keys_to_ignore_on_load_unexpected = [r"^mtp.*"], which is why this was
+    # previously disabled. Export is opt-in (mtp_only / no_mtp still gate it).
+    supports_mtp_export = True
+    no_mtp = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # MTP: the draft block occupies one extra block id past the main stack.
+        # This MUST happen here rather than in set_gguf_parameters, because
+        # block_count is consumed twice before that runs:
+        #   1. base.set_gguf_parameters() calls add_block_count() with whatever
+        #      value is set at that point, and the arch's override calls super()
+        #      first -- so a later assignment would be ignored; and
+        #   2. tensor_map is built from block_count, so the MTP layer's
+        #      blk.<n_layer>.* names would not resolve at all.
+        # deepseek.py sets it in __init__ for exactly these reasons.
+        mtp_layers = int(self.hparams.get("mtp_num_hidden_layers") or 0)
+        if not self.no_mtp and mtp_layers:
+            self.block_count += mtp_layers
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
@@ -58,14 +76,42 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
 
         n_layer = hp["num_hidden_layers"]
+
+        # block_count is already bumped in __init__ (see there for why). Only
+        # the metadata key is written here, mirroring the NEXTN convention.
+        mtp_layers = hp.get("mtp_num_hidden_layers") or 0
+        if not self.no_mtp and mtp_layers:
+            self.gguf_writer.add_nextn_predict_layers(int(mtp_layers))
+
         self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
         self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+
+        # One entry per BLOCK ID, not per trunk layer. The loader reads this array
+        # with n_layer_all and hard-fails on a length mismatch, so a 48-entry array
+        # against a 49-block model refuses to load. Missing the MTP entry would be
+        # quiet rather than loud if the length check were absent: build_layer_attn
+        # keys QSA off `dsv4_compress_ratios[il] > 0`, so a 0 silently downgrades
+        # the draft block to dense attention -- wrong drafts, no error.
+        n_mtp_block = int(self.block_count) - int(n_layer)
+        if n_mtp_block > 0:
+            mtp_types = (hp.get("mtp") or {}).get("layer_types") or ["full_attention"] * n_mtp_block
+            if len(mtp_types) != n_mtp_block:
+                raise ValueError(
+                    f"mtp.layer_types has {len(mtp_types)} entries but the model has "
+                    f"{n_mtp_block} MTP block(s)"
+                )
+            for lt in mtp_types:
+                if lt != "full_attention":
+                    raise ValueError(
+                        f"unsupported MTP layer type {lt!r}: only full_attention is handled"
+                    )
+                ratios.append(ratio)
+
+        self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
@@ -120,6 +166,13 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
+        # --- MTP block -------------------------------------------------
+        # The MTP layer mirrors a main decoder layer, so its per-layer tensors
+        # reuse the main layer's mapping at the MTP block id. Only the fusion
+        # and mixer tensors are unique to MTP.
+        if name.startswith("mtp."):
+            return self._map_mtp_tensor(data_torch, name, bid)
+
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
             n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
@@ -139,6 +192,47 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return [(self.map_tensor_name(name), data_torch.squeeze())]
 
         return super().modify_tensors(data_torch, name, bid)
+
+    def _mtp_block_id(self) -> int:
+        """Block id of the MTP layer: one past the main stack."""
+        return int(self.hparams["num_hidden_layers"])
+
+    _MTP_MIXER = {
+        "hc_norm.weight":        "NEXTN_HC_MIXER_NORM",
+        "input_mix_weight_down.weight": "NEXTN_HC_MIXER_DOWN",
+        "input_mix_weight_up.weight":   "NEXTN_HC_MIXER_UP",
+    }
+    _MTP_HEAD = {
+        "fc_embedding.weight":           "NEXTN_FC_EMBEDDING",
+        "fc_hidden.weight":              "NEXTN_FC_HIDDEN",
+        "pre_fc_norm_embedding.weight":  "NEXTN_PRE_FC_NORM_EMBEDDING",
+        "pre_fc_norm_hidden.weight":     "NEXTN_PRE_FC_NORM_HIDDEN",
+    }
+
+    def _map_mtp_tensor(self, data_torch, name: str, bid):
+        """Map one `mtp.*` source tensor to its GGUF name."""
+        rest = name[len("mtp."):]
+
+        # MTP head-level fusion tensors and the HCMixer
+        if rest in self._MTP_HEAD:
+            t = getattr(gguf.MODEL_TENSOR, self._MTP_HEAD[rest])
+            return [(self.format_tensor_name(t), data_torch)]
+        if rest.startswith("hyper_connection_mixer."):
+            suffix = rest[len("hyper_connection_mixer."):]
+            if suffix not in self._MTP_MIXER:
+                raise ValueError(f"unhandled MTP mixer tensor: {name}")
+            t = getattr(gguf.MODEL_TENSOR, self._MTP_MIXER[suffix])
+            return [(self.format_tensor_name(t), data_torch)]
+
+        # Per-layer tensors: rewrite to the main layer prefix at the MTP block id
+        # and reuse the main mapping, so shapes/quirks (indexer split, norm gain,
+        # expert stacks) are handled exactly once.
+        prefix = "layers.0."
+        if not rest.startswith(prefix):
+            raise ValueError(f"unhandled MTP tensor: {name}")
+        main_name = ("model.language_model.layers."
+                     f"{self._mtp_block_id()}." + rest[len(prefix):])
+        return super().modify_tensors(data_torch, main_name, self._mtp_block_id())
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time

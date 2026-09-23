@@ -151,12 +151,19 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        // allocation order inside one buffer type: 0 = hot (read on every token), 1 = cold (MoE expert banks).
+        // Buffers are allocated in key order, so when a device buffer type overflows the fastest memory the hot
+        // context claims the fast chunks first and the expert banks take what is left.
+        int prio;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.prio != rhs.prio) {
+                return lhs.prio < rhs.prio;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }

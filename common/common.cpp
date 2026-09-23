@@ -1308,7 +1308,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
-        cparams_dft.n_rs_seq = 0;
+        // The draft context must be able to roll back a rejected speculative
+        // suffix, and that is exactly what n_rs_seq buys: llama_memory_recurrent::seq_rm
+        // refuses a partial rollback when
+        //   rollback <= n_rs_seq
+        // does not hold, and common_context_seq_rm ABORTS on a false return. Leaving
+        // this at 0 makes every speculative rollback fatal on a hybrid draft context.
+        // Sized to the draft depth the speculation actually asks for.
+        cparams_dft.n_rs_seq = std::max(1, params.speculative.draft.n_max);
 
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
@@ -1715,7 +1722,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // --load-mtp asks for the MTP head on its own, so the loader can be exercised
+    // (and the tensors checked) without the full draft-model speculation setup.
+    // The speculative path implies it too, hence the OR.
+    mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }

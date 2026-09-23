@@ -4961,6 +4961,182 @@ size_t quantize_iq1_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * nblock * sizeof(block_iq1_m);
 }
 
+
+// ============================ R4X-V2 D32A3 ============================
+// 32 values, fp16 scale, 32 packed 3-bit codes with FIXED Lloyd-Max levels.
+// Encoder: least-squares scale fitting (spec: research/r4x-v2/02_CANDIDATES/d32a3/SPEC.md).
+static const float D32A3_LEVELS[8] = {
+    -2.151945f, -1.343910f, -0.756005f, -0.245094f, 0.245094f, 0.756005f, 1.343910f, 2.151945f
+};
+
+void dequantize_row_d32a3(const block_d32a3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_D32A3 == 0);
+    const int64_t nb = k / QK_D32A3;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        unsigned __int128 U = 0;
+        for (int b = 0; b < 12; b++) {
+            U |= (unsigned __int128) x[i].qs[b] << (8*b);
+        }
+        for (int j = 0; j < QK_D32A3; j++) {
+            const uint32_t code = (uint32_t) ((U >> (3*j)) & 7);
+            y[i*QK_D32A3 + j] = D32A3_LEVELS[code] * d;
+        }
+    }
+}
+
+void quantize_row_d32a3_ref(const float * GGML_RESTRICT x, block_d32a3 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_D32A3 == 0);
+    const int64_t nb = k / QK_D32A3;
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i*QK_D32A3;
+        float amax = 0.0f;
+        for (int j = 0; j < QK_D32A3; j++) { amax = fmaxf(amax, fabsf(xb[j])); }
+        float scale = amax / 2.151945f;
+        uint8_t codes[QK_D32A3];
+        memset(codes, 0, sizeof(codes));
+        // 3 least-squares refits (measured: +0.4% error vs 6 iterations, 1.7x faster) and an
+        // unrolled 8-way level search so the compiler can vectorise the inner loop.
+        for (int it = 0; it < 3 && scale != 0.0f; it++) {
+            float num = 0.0f, den = 0.0f;
+            const float l0 = D32A3_LEVELS[0]*scale, l1 = D32A3_LEVELS[1]*scale, l2 = D32A3_LEVELS[2]*scale, l3 = D32A3_LEVELS[3]*scale;
+            const float l4 = D32A3_LEVELS[4]*scale, l5 = D32A3_LEVELS[5]*scale, l6 = D32A3_LEVELS[6]*scale, l7 = D32A3_LEVELS[7]*scale;
+            for (int j = 0; j < QK_D32A3; j++) {
+                const float xv = xb[j];
+                float best = fabsf(xv - l0); int bi = 0;
+                float d;
+                d = fabsf(xv - l1); if (d < best) { best = d; bi = 1; }
+                d = fabsf(xv - l2); if (d < best) { best = d; bi = 2; }
+                d = fabsf(xv - l3); if (d < best) { best = d; bi = 3; }
+                d = fabsf(xv - l4); if (d < best) { best = d; bi = 4; }
+                d = fabsf(xv - l5); if (d < best) { best = d; bi = 5; }
+                d = fabsf(xv - l6); if (d < best) { best = d; bi = 6; }
+                d = fabsf(xv - l7); if (d < best) { best = d; bi = 7; }
+                codes[j] = (uint8_t) bi;
+                num += xv*D32A3_LEVELS[bi];
+                den += D32A3_LEVELS[bi]*D32A3_LEVELS[bi];
+            }
+            scale = den > 0.0f ? num/den : 0.0f;
+        }
+        const ggml_half d16 = GGML_FP32_TO_FP16(scale);
+        const float d16f = GGML_FP16_TO_FP32(d16);
+        if (d16f != 0.0f) {   // final code pass at the stored scale
+            const float c0 = D32A3_LEVELS[0]*d16f, c1 = D32A3_LEVELS[1]*d16f, c2 = D32A3_LEVELS[2]*d16f, c3 = D32A3_LEVELS[3]*d16f;
+            const float c4 = D32A3_LEVELS[4]*d16f, c5 = D32A3_LEVELS[5]*d16f, c6 = D32A3_LEVELS[6]*d16f, c7 = D32A3_LEVELS[7]*d16f;
+            for (int j = 0; j < QK_D32A3; j++) {
+                const float xv = xb[j];
+                float best = fabsf(xv - c0); int bi = 0;
+                float d;
+                d = fabsf(xv - c1); if (d < best) { best = d; bi = 1; }
+                d = fabsf(xv - c2); if (d < best) { best = d; bi = 2; }
+                d = fabsf(xv - c3); if (d < best) { best = d; bi = 3; }
+                d = fabsf(xv - c4); if (d < best) { best = d; bi = 4; }
+                d = fabsf(xv - c5); if (d < best) { best = d; bi = 5; }
+                d = fabsf(xv - c6); if (d < best) { best = d; bi = 6; }
+                d = fabsf(xv - c7); if (d < best) { best = d; bi = 7; }
+                codes[j] = (uint8_t) bi;
+            }
+        } else {
+            memset(codes, 0, sizeof(codes));
+        }
+        y[i].d = d16;
+        unsigned __int128 U = 0;
+        for (int j = 0; j < QK_D32A3; j++) {
+            U |= (unsigned __int128) (codes[j] & 7u) << (3*j);
+        }
+        for (int b = 0; b < 12; b++) {
+            y[i].qs[b] = (uint8_t) ((U >> (8*b)) & 0xFF);
+        }
+    }
+}
+
+
+// ============================ R4X MIX34 (v1.g) ============================
+// 640 values per block: 20 subblocks of 32. Each subblock is encoded with BOTH component codecs
+// (D32A3 14 B, IQ4_NL 18 B, both existing authorities); the 12 subblocks with the largest error
+// reduction (E_d32a3 - E_iq4nl) are stored as IQ4_NL, the other 8 as D32A3. The selector records
+// which is which. Selector objective is FROZEN: greedy top-12 by error reduction, ties by index.
+static void mix34_pack_group(const float * x, block_mix34 * y) {
+    block_d32a3 b3[20];
+    block_iq4_nl b4[20];
+    float d3[20][32], d4[20][32];
+    double gain[20];
+    for (int i = 0; i < 20; i++) {
+        quantize_row_d32a3_ref  (x + 32*i, &b3[i], 32);
+        quantize_row_iq4_nl_ref (x + 32*i, &b4[i], 32);
+        dequantize_row_d32a3(&b3[i], d3[i], 32);
+        dequantize_row_iq4_nl(&b4[i], d4[i], 32);
+        double e3 = 0.0, e4 = 0.0;
+        for (int j = 0; j < 32; j++) {
+            const double t = x[32*i + j];
+            const double a = d3[i][j] - t, b = d4[i][j] - t;
+            e3 += a*a; e4 += b*b;
+        }
+        gain[i] = e3 - e4;   // error saved by choosing IQ4_NL
+    }
+    // The block layout is FIXED at 8 three-bit + 12 four-bit payloads (14 B and 18 B exactly fill
+    // 332 B), so exactly QK_MIX34_FOURBIT selector bits must be set. Choosing fewer would leave
+    // payload space that the decoder still reads, so the 12 largest gains are always taken even if
+    // some of them are non-positive.
+    uint32_t selector = 0;
+    for (int k = 0; k < QK_MIX34_FOURBIT; k++) {
+        int best = -1;
+        for (int i = 0; i < 20; i++) {
+            if ((selector >> i) & 1u) continue;
+            if (best < 0 || gain[i] > gain[best]) best = i;
+        }
+        assert(best >= 0);
+        selector |= (1u << best);
+    }
+    assert(__builtin_popcount(selector) == QK_MIX34_FOURBIT);
+    y->selector = selector;
+    uint8_t * p3 = y->payload;
+    uint8_t * p4 = y->payload + 8*14;
+    for (int i = 0; i < 20; i++) {
+        if ((selector >> i) & 1u) { memcpy(p4, &b4[i], 18); p4 += 18; }
+        else                      { memcpy(p3, &b3[i], 14); p3 += 14; }
+    }
+}
+
+void quantize_row_mix34_ref(const float * GGML_RESTRICT x, block_mix34 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MIX34 == 0);
+    for (int64_t i = 0; i < k/QK_MIX34; i++) mix34_pack_group(x + i*QK_MIX34, y + i);
+}
+
+void dequantize_row_mix34(const block_mix34 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MIX34 == 0);
+    for (int64_t g = 0; g < k/QK_MIX34; g++) {
+        const block_mix34 * b = x + g;
+        const uint8_t * p3 = b->payload;
+        const uint8_t * p4 = b->payload + 8*14;
+        for (int i = 0; i < 20; i++) {
+            float out[32];
+            if ((b->selector >> i) & 1u) { dequantize_row_iq4_nl((const block_iq4_nl *) p4, out, 32); p4 += 18; }
+            else                         { dequantize_row_d32a3 ((const block_d32a3 *)  p3, out, 32); p3 += 14; }
+            memcpy(y + g*QK_MIX34 + 32*i, out, 32*sizeof(float));
+        }
+    }
+}
+
+size_t quantize_mix34(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void) imatrix;
+    assert(n_per_row % QK_MIX34 == 0);
+    const int64_t nb = n_per_row / QK_MIX34;
+    for (int64_t r = 0; r < nrows; r++) {
+        for (int64_t g = 0; g < nb; g++) {
+            mix34_pack_group(src + r*n_per_row + g*QK_MIX34, (block_mix34 *) dst + r*nb + g);
+        }
+    }
+    return (size_t) nrows * nb * sizeof(block_mix34);
+}
+
+size_t quantize_d32a3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void) imatrix;
+    const int64_t n = nrows * n_per_row;
+    quantize_row_d32a3_ref(src, (block_d32a3 *) dst, n);
+    return (size_t) (n/QK_D32A3) * sizeof(block_d32a3);
+}
+
 // ============================ 4-bit non-linear quants
 
 static void quantize_row_iq4_nl_impl(const int super_block_size, const int block_size, const float * GGML_RESTRICT x,
@@ -5648,6 +5824,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ4_NL:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+            } break;
+        case GGML_TYPE_D32A3:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_d32a3, data, nb);
             } break;
 
         case GGML_TYPE_I8:

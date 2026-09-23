@@ -1119,8 +1119,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, bool is_expert) -> ggml_context * {
+        const ctx_key key { buft, is_lazy, is_expert ? 1 : 0 };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1151,7 +1151,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return it->second.get();
     };
 
-    auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+    auto buft_for_tensor = [&](ggml_tensor * t_meta, bool * is_expert_out = nullptr) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
@@ -1188,6 +1188,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
         // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
+        if (is_expert_out != nullptr) {
+            *is_expert_out = info.op == GGML_OP_MUL_MAT_ID;
+        }
         if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
@@ -1325,9 +1328,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_set_name(&t_meta, tn.str().c_str());
 
-        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+        bool is_expert = false;
+        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta, &is_expert);
         GGML_ASSERT(buft != nullptr);
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(buft, is_expert);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
@@ -1360,12 +1364,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
-    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    bool is_expert = false;
+    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta, &is_expert);
     if (buft == nullptr) {
         return nullptr;
     }
 
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = ctx_for_buft(buft, is_expert);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {

@@ -1426,7 +1426,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        // [dev] LLAMA_DUMP_VALUES=<name-substring>: dump the values of matching tensors (routing study)
+        if (const char * dump_pat = getenv("LLAMA_DUMP_VALUES")) {
+            static const char * pat = dump_pat;
+            auto dump_cb = [](ggml_tensor * t, bool ask, void * ud) -> bool {
+                const char * pattern = (const char *) ud;
+                if (ask) {
+                    return strstr(t->name, pattern) != nullptr;
+                }
+                if (t->type == GGML_TYPE_I32) {
+                    std::vector<int32_t> buf(ggml_nelements(t));
+                    ggml_backend_tensor_get(t, buf.data(), 0, buf.size()*sizeof(int32_t));
+                    fprintf(stdout, "DUMP %s ne=%lld:", t->name, (long long) buf.size());
+                    for (size_t i = 0; i < buf.size(); i++) fprintf(stdout, " %d", buf[i]);
+                    fprintf(stdout, "\n");
+                    fflush(stdout);
+                } else if (t->type == GGML_TYPE_F32) {
+                    std::vector<float> buf(ggml_nelements(t));
+                    ggml_backend_tensor_get(t, buf.data(), 0, buf.size()*sizeof(float));
+                    fprintf(stdout, "DUMPF %s ne=%lld:", t->name, (long long) buf.size());
+                    for (size_t i = 0; i < buf.size() && i < 64; i++) fprintf(stdout, " %.4f", buf[i]);
+                    fprintf(stdout, "\n");
+                    fflush(stdout);
+                }
+                return true;
+            };
+            ggml_backend_sched_set_eval_callback(sched.get(), dump_cb, (void *) pat);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 

@@ -457,6 +457,27 @@ typedef struct {
     uint8_t  scales_l[QK_K/64];
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
+
+// R4X-V2 D32A3: 32 values, fp16 scale, 32 packed 3-bit codes (Lloyd-Max levels) = 14 bytes
+#define QK_D32A3 32
+typedef struct {
+    ggml_half d;       // scale (least-squares fitted, stored as binary16)
+    uint8_t qs[12];    // 32 x 3-bit codes, little-endian bit order
+} block_d32a3;
+static_assert(sizeof(block_d32a3) == 14, "wrong d32a3 block size/padding");
+// R4X MIX34 v1.g: 640 values = 20 subblocks of 32 values. Exactly 12 subblocks carry IQ4_NL
+// payloads (18 B) and 8 carry D32A3 payloads (14 B); `selector` bit i = 1 marks subblock i as
+// IQ4_NL. Payload order: the 3-bit (D32A3) payloads in increasing subblock index, then the 4-bit
+// (IQ4_NL) payloads, likewise. Total = 4 + 8*14 + 12*18 = 332 bytes.
+#define QK_MIX34 640
+#define QK_MIX34_FOURBIT 12
+typedef struct {
+    uint32_t selector;
+    uint8_t  payload[QK_MIX34/32 - QK_MIX34_FOURBIT == 0 ? 1 : (QK_MIX34/32 - QK_MIX34_FOURBIT)*14 + QK_MIX34_FOURBIT*18];
+} block_mix34;
+static_assert(sizeof(block_mix34) == 332, "wrong mix34 block size/padding");
+static_assert(sizeof(block_d32a3) + 0 == 14, "d32a3 payload size changed; MIX34 layout invalid");
+static_assert(sizeof(block_iq4_nl) == 18, "iq4_nl payload size changed; MIX34 layout invalid");
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
 #endif // GGML_COMMON_DECL
