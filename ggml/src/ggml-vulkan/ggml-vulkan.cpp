@@ -1,5 +1,10 @@
 #include "ggml-vulkan-common.h"
 
+// campaign probe hooks: defined further down the file, used by the quantised
+// dispatch paths above their definitions.
+static void ggml_vk_mix34_probe(const char * op);
+static void ggml_vk_d32a3_probe(const char * op);
+
 // lane/copy-census: exported counters so the scheduler can attribute submits/waits per copy.
 GGML_API uint64_t alice_mc_vk_submit = 0;
 GGML_API uint64_t alice_mc_vk_wait   = 0;
